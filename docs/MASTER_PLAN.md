@@ -5,16 +5,17 @@ This document defines the complete phased engineering roadmap for Airbitrage. Ea
 ---
 
 ## Current Status Overview
-* **Active Milestone:** Phase 2 (M2 Bybit Market Data)
-* **M0 STATUS: COMPLETE** (Foundation & Project Scaffolding)
-* **M1 STATUS: COMPLETE** (Binance Public Market-Data Ingestion)
-* **Rust Version:** `rustc 1.98.1 (48a229cea 2026-09-01)` / Edition `2024`
+* **Active Status:**
+  * **M0 STATUS: COMPLETE** (Foundation & Project Scaffolding — Commit `52ccb6f`)
+  * **M1 STATUS: COMPLETE WITH M1.1 HARDENING** (Binance Protocol & Market-State Hardening)
+  * **M2 STATUS: NOT STARTED** (Bybit Public Market-Data Ingestion)
+* **Rust Toolchain:** `rustc 1.98.1 (48a229cea 2026-09-01)` / Edition `2024`
 * **Cargo Check:** PASSED (0 errors, 0 warnings)
-* **Cargo Test:** PASSED (19 passed; 0 failed; 0 ignored across M0 and M1 test suites)
+* **Cargo Test:** PASSED (24 passed; 0 failed across foundation and hardened binance feed suites)
 * **Cargo Clippy:** PASSED (`--all-targets --all-features -- -D warnings`, 0 warnings)
 * **Cargo Fmt:** PASSED (`cargo fmt --check`, 0 diffs)
-* **Live Smoke Test:** PASSED (Binance Spot & USD-M Futures streams connected and parsed live quotes)
-* **Live Soak Test:** PASSED (15s continuous run: 269 messages received, 267 parsed, 0 rejected, 0 errors, 0 crossed books)
+* **Live Smoke Test:** PASSED (Binance Spot, Futures Depth `/public`, and Futures Mark Price `/market` streams verified live)
+* **Extended Soak Test:** PASSED (60.00s continuous run: 1,126 stream messages received, 1,126 processed, 0 parse errors, 0 validation errors, 0 backpressure drops, 0 crossed books, p50: 8 µs, p99: 46 µs, peak working set: 15.12 MB)
 
 ---
 
@@ -37,21 +38,35 @@ This document defines the complete phased engineering roadmap for Airbitrage. Ea
 
 ---
 
-## Phase 1 — Binance Market Data (M1)
-* **Goal:** Implement an unauthenticated public WebSocket client for Binance Spot and USD-M Futures, subscribing to partial depth (`@depth20@100ms`) and mark price streams, emitting normalized `MarketEvent` instances over a bounded channel.
-* **Inputs:** Public Binance WebSocket streams (`wss://stream.binance.com:9443/ws`, `wss://fstream.binance.com/ws`).
-* **Outputs:** Normalized stream of `MarketEvent::OrderBookSnapshot` and `MarketEvent::FundingRateUpdate`.
-* **Files/Modules:** `src/venues/binance.rs`, `tests/binance_feed_tests.rs`.
-* **Dependencies:** `tokio` (rt, macros), `tokio-tungstenite`, `rustls-tls`.
-* **Tests:** Mock WebSocket payload deserialization, bad frame rejection, reconnect backoff timing test.
-* **Benchmarks:** JSON parsing benchmark ($< 25\,\mu\text{s}$ target).
-* **Acceptance Criteria:** Stream connects, parses live BTCUSDT Spot and Perp frames continuously for 1 hour without panic, emits monotonically timed events.
-* **Failure Criteria:** Unhandled disconnect, dropped packets without error flag, memory leak under steady stream.
-* **Explicitly NOT Included:** Bybit connector, local book mutation, spread calculation, API keys.
+## Phase 1 — Binance Market Data & Protocol Hardening (M1 & M1.1)
+* **Goal:** Implement an unauthenticated public WebSocket client for Binance Spot and USD-M Futures complying with the 2026 routed architecture, distinguishing snapshot vs delta semantics, preserving update sequence IDs (`U`, `u`, `pu`), ingesting mark price & funding rate, and tracking per-stream freshness.
+* **Inputs:**
+  * Binance Spot WebSocket: `wss://stream.binance.com/ws` (`<symbol>@depth20@100ms`)
+  * Binance USD-M Futures Public Route: `wss://fstream.binance.com/public/ws` (`<symbol>@depth20@100ms`)
+  * Binance USD-M Futures Market Route: `wss://fstream.binance.com/market/ws` (`<symbol>@markPrice@1s`)
+* **Outputs:** Normalized stream of:
+  * `MarketEvent::OrderBookSnapshot` (Spot full snapshots)
+  * `MarketEvent::OrderBookDelta` (Futures incremental updates with `U`, `u`, `pu`, `E`, `T`)
+  * `MarketEvent::FundingRateUpdate` (Perpetual mark price, index price, funding rate, settlement ts)
+  * `MarketEvent::ConnectionState` (Lifecycle transitions)
+* **Files/Modules:** `src/venues/binance.rs`, `src/types.rs`, `src/main.rs`, `tests/binance_feed_tests.rs`.
+* **Dependencies:** `tokio` (rt, macros, sync), `tokio-tungstenite`, `native-tls`, `futures-util`, `rust_decimal`.
+* **Hardening Improvements (M1.1):**
+  1. *Futures Routed Endpoints:* Migrated from legacy `fstream.binance.com/ws` to dedicated `/public/ws` (depth) and `/market/ws` (mark price) base URLs.
+  2. *True Event Semantics:* Futures `depthUpdate` emitted as `OrderBookDelta`, retaining `U`, `u`, `pu`, matching engine transaction timestamp `T`, and gateway event timestamp `E`.
+  3. *Direct Strongly-Typed Deserialization:* Removed intermediate `serde_json::Value` parsing and cloning; payloads deserialize directly into typed structs.
+  4. *Mark Price & Funding Ingestion:* Emits mark price, index price, funding rate, and next funding timestamp with microsecond-level local arrival tracking.
+  5. *Per-Stream Freshness & Stale Detection:* Individual streams (`SpotDepth`, `FuturesDepth`, `FuturesMarkPrice`) tracked with cadence-aware staleness thresholds.
+  6. *Granular Metrics:* Specific counters for stream message counts, ACKs, parse errors, validation errors, crossed books, stale events, and backpressure drops.
+* **Acceptance Criteria:**
+  * `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy -- -D warnings` all exit 0.
+  * Live smoke test verifies all 3 streams with sequence identifiers and funding fields observed.
+  * Continuous soak test demonstrates 0 parse errors, 0 validation errors, 0 backpressure drops, and deterministic memory usage.
+* **Explicitly NOT Included:** Bybit connector (M2), cross-venue comparison, VWAP calculation, fee deductions, arbitrage detection, execution.
 
 ---
 
-## Phase 2 — Bybit Market Data (M2)
+## Phase 2 — Bybit Market Data (M2) — *NOT STARTED*
 * **Goal:** Implement an unauthenticated public WebSocket client for Bybit V5 Spot and Linear Futures, handling connection management, 20s ping/pong heartbeats, and subscribing to `orderbook.50` and `tickers` topics.
 * **Inputs:** Public Bybit WebSocket streams (`wss://stream.bybit.com/v5/public/spot`, `/linear`).
 * **Outputs:** Normalized stream of `MarketEvent::OrderBookSnapshot`, `MarketEvent::OrderBookDelta`, and `MarketEvent::FundingRateUpdate`.
@@ -59,7 +74,7 @@ This document defines the complete phased engineering roadmap for Airbitrage. Ea
 * **Dependencies:** Reuses network stack from M1.
 * **Tests:** Snapshot initialisation verification, delta application parsing, heartbeat ping/pong timer verification.
 * **Benchmarks:** Frame normalization throughput benchmark.
-* **Acceptance Criteria:** Sustained 1-hour live stream of BTCUSDT Spot and Linear with zero unhandled frame drops.
+* **Acceptance Criteria:** Sustained live stream of BTCUSDT Spot and Linear with zero unhandled frame drops.
 * **Failure Criteria:** Heartbeat timeout disconnects, sequence gaps unflagged.
 * **Explicitly NOT Included:** Cross-venue comparison, order execution, private endpoints.
 
@@ -146,75 +161,3 @@ This document defines the complete phased engineering roadmap for Airbitrage. Ea
 * **Acceptance Criteria:** Uninterrupted recording over 24 hours; files cleanly decompress with 100% byte fidelity.
 * **Failure Criteria:** Disk I/O blocking the hot-path network reader.
 * **Explicitly NOT Included:** Database inserts of every tick.
-
----
-
-## Phase 9 — Replay Engine (M9)
-* **Goal:** Build a deterministic historical replay engine that feeds recorded `.zst` tick streams back into the exact same canonical engine pipeline.
-* **Inputs:** Compressed historical market data files from M8.
-* **Outputs:** Identical sequence of `MarketEvent`, order book states, and detected dislocations as live mode.
-* **Files/Modules:** `src/replay/mod.rs`, `src/replay/feeder.rs`.
-* **Dependencies:** Core engine and M8 storage.
-* **Tests:** Replay determinism test (feed live, record, replay, assert state equality).
-* **Benchmarks:** Replay processing speed ($> 50,000\text{ msgs/sec}$ offline throughput).
-* **Acceptance Criteria:** Replay produces bit-for-bit identical dislocation events from recorded data.
-* **Failure Criteria:** Code divergence between live ingestion and historical replay paths.
-* **Explicitly NOT Included:** Live trading.
-
----
-
-## Phase 10 — Paper Execution Simulator (M10)
-* **Goal:** Simulate two-legged order execution against live or replayed market data, modeling order transit delay, queue priority, partial fills, and leg failure.
-* **Inputs:** `DislocationEvent` signals from M6 and ongoing order book depth.
-* **Outputs:** `SimulatedExecutionReport { leg_a_fill: Fill, leg_b_fill: Fill, realized_pnl: Decimal, unhedged_duration_ms: u64 }`.
-* **Files/Modules:** `src/execution/paper.rs`, `src/execution/fsm.rs`.
-* **Dependencies:** Core engine.
-* **Tests:** State machine transition tests (Reject, Full Fill, Partial Fill, Emergency Abort).
-* **Benchmarks:** Execution simulation latency ($< 10\,\mu\text{s}$).
-* **Acceptance Criteria:** Realistic slippage and partial fill models produce realistic P&L distributions.
-* **Failure Criteria:** Assuming instantaneous fills at observed top-of-book prices.
-* **Explicitly NOT Included:** Live order routing, private exchange keys.
-
----
-
-## Phase 11 — Risk Engine & Kill Switches (M11)
-* **Goal:** Implement non-negotiable risk gates and automated circuit breakers that override strategy signals during market anomalies.
-* **Inputs:** System health metrics, feed freshness, cumulative simulated daily loss, unhedged exposure.
-* **Outputs:** `RiskDecision::Allow` or `RiskDecision::Halt(Reason)`.
-* **Files/Modules:** `src/risk/engine.rs`, `src/risk/breakers.rs`.
-* **Dependencies:** Core engine.
-* **Tests:** Stale data trip test, maximum drawdown trip test, sequence gap trip test.
-* **Benchmarks:** Risk check evaluation ($< 1\,\mu\text{s}$).
-* **Acceptance Criteria:** Risk engine terminates execution intent within $100\,\mu\text{s}$ of anomalous state detection.
-* **Failure Criteria:** Any code path allowing an execution intent to bypass risk gates.
-* **Explicitly NOT Included:** Live trading.
-
----
-
-## Phase 12 — Statistical Strategy Evaluation (M12)
-* **Goal:** Analyze captured dislocation datasets and paper trading runs to determine whether any observed strategy satisfies statistical viability criteria.
-* **Inputs:** SQLite dislocation database, paper trading execution logs.
-* **Outputs:** Formal statistical report: expected net value, Sharpe ratio, half-life distributions, failure rates.
-* **Files/Modules:** `research/analysis.py` (DuckDB / Polars pipeline).
-* **Dependencies:** Python 3.11, DuckDB, Polars.
-* **Tests:** Data consistency verification between SQLite and analytical aggregates.
-* **Benchmarks:** Offline report generation ($< 60\text{s}$ over 10M records).
-* **Acceptance Criteria:** Objective pass/kill determination on examined strategy families.
-* **Failure Criteria:** Confirming viability without statistical significance ($p < 0.01$).
-* **Explicitly NOT Included:** Live trading.
-
----
-
-## Phase 13 — Additional Venues (M13)
-* **Goal:** Plug in additional candidate venues (e.g., OKX, Kraken, or specialized DEX pools) using the established venue adapter pattern without altering core engine logic.
-* **Inputs:** Target exchange public API documentation and WebSockets.
-* **Outputs:** New venue connector module emitting standard `MarketEvent` instances.
-* **Files/Modules:** `src/venues/<venue>.rs`.
-* **Acceptance Criteria:** Core engine compiles and operates without modifying `src/market/` or `src/engine/`.
-
----
-
-## Phase 14 — Controlled Live Execution (M14 — Future)
-* **Goal:** Deploy micro-capital live execution only if Phase 12 statistically proves a durable edge.
-* **Prerequisites:** Complete compliance, tax, and legal clearance; strict multi-factor authentication and hard stop-loss limits.
-* **Explicitly Excluded from Present Scope.**

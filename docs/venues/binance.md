@@ -4,126 +4,119 @@ This document records first-party verified protocols, stream schemas, endpoints,
 
 ---
 
-## 1. Endpoints & Connectivity
+## 1. Endpoints & Connectivity Architecture
 
 ### 1.1 Binance Spot
-* **Raw WebSocket Stream:** `wss://stream.binance.com:9443/ws`
-* **Combined WebSocket Stream:** `wss://stream.binance.com:9443/stream?streams=<streamName1>/<streamName2>`
+* **Base WebSocket Endpoint:** `wss://stream.binance.com/ws` (using standard TLS port 443; port 9443 is blocked on certain residential ISPs/firewalls).
+* **Combined WebSocket Stream:** `wss://stream.binance.com/stream?streams=<streamName1>/<streamName2>`
 * **Connection Lifecycle:** 
-  * A single connection is valid for up to 24 hours. The server will disconnect connections reaching 24h.
+  * Maximum single connection lifetime: 24 hours. The gateway will disconnect connections reaching 24h.
   * Maximum 1,024 streams per single WebSocket connection.
-  * Incoming message limit: Maximum 5 messages per second; exceeding this triggers connection termination and potential IP ban.
-  * WebSocket Ping/Pong: The Binance gateway periodically sends standard WebSocket ping frames (RFC 6455). Clients must respond with pong frames (handled automatically by `tokio-tungstenite`).
+  * Incoming rate limit: Maximum 5 messages per second to the server.
+  * Keep-alive ping frames: Server sends RFC 6455 Ping frames periodically; client responds with standard Pong frames.
 
-### 1.2 Binance USD-M Futures
-* **Raw WebSocket Stream:** `wss://fstream.binance.com/ws`
-* **Combined WebSocket Stream:** `wss://fstream.binance.com/stream?streams=<streamName1>/<streamName2>`
-* **Connection Lifecycle:**
-  * Same 24-hour connection lifetime.
-  * Rate limits: Maximum 5 messages/sec sent to the server.
-  * Keep-alive ping frames sent every 3 minutes; client must respond with pong.
+### 1.2 Binance USD-M Futures (2026 Routed Architecture)
+Binance USD-M Futures separates traffic across three distinct, dedicated route endpoints. The legacy unrouted endpoint (`wss://fstream.binance.com/ws`) is deprecated and retired.
+
+1. **Public Market Data Route (`/public`):**
+   * **URL:** `wss://fstream.binance.com/public/ws`
+   * **Streams:** High-frequency market data such as order book depth (`<symbol>@depth20@100ms`, `<symbol>@depth@100ms`) and aggregated trades (`<symbol>@aggTrade`).
+2. **General Market Data Route (`/market`):**
+   * **URL:** `wss://fstream.binance.com/market/ws`
+   * **Streams:** Regular cadence market data such as mark price (`<symbol>@markPrice@1s`), tickers, and Kline updates.
+   * *Critical Note:* Subscribing to `@markPrice` on `/public` or unrouted base URLs fails silently or disconnects. The `/market` route must be strictly used.
+3. **Private User Data Route (`/private`):**
+   * **URL:** `wss://fstream.binance.com/private/ws?listenKey=<listenKey>`
+   * *Excluded from V1 Scope.*
 
 ---
 
-## 2. Stream Subscriptions & Payloads
+## 2. Stream Subscriptions & Canonical Event Mapping
 
-### 2.1 Spot Partial Book Depth (`<symbol>@depth<levels>@100ms`)
+### 2.1 Spot Partial Book Depth (`<symbol>@depth20@100ms`)
+* **Endpoint:** `wss://stream.binance.com/ws`
 * **Topic Name:** `btcusdt@depth20@100ms`
-* **Push Frequency:** Pushed every 100 milliseconds.
-* **Content:** Snapshot of the top 20 bids and asks sorted respectively.
-* **Subscription Request:**
-  ```json
-  {
-    "method": "SUBSCRIBE",
-    "params": [
-      "btcusdt@depth20@100ms"
-    ],
-    "id": 1
-  }
-  ```
+* **Cadence:** Pushed every 100 milliseconds.
+* **Semantic Contract:** Full snapshot of the top 20 bid and ask price levels.
+* **Canonical Mapping:** `MarketEvent::OrderBookSnapshot`
 * **Payload Structure:**
   ```json
   {
-    "lastUpdateId": 47291849102,
+    "lastUpdateId": 100706410507,
     "bids": [
-      ["64210.50", "0.45000000"],
-      ["64210.00", "1.25000000"]
+      ["84343.08000000", "0.45000000"],
+      ["84343.00000000", "1.25000000"]
     ],
     "asks": [
-      ["64211.00", "0.82000000"],
-      ["64211.50", "2.10000000"]
+      ["84343.09000000", "0.82000000"],
+      ["84343.50000000", "2.10000000"]
     ]
   }
   ```
-  *(Note: If consumed through `/stream?streams=`, the payload is wrapped in `{"stream":"btcusdt@depth20@100ms", "data":{...}}`)*
 
-### 2.2 USD-M Futures Partial Book Depth (`<symbol>@depth<levels>@100ms`)
+### 2.2 USD-M Futures Depth Updates (`<symbol>@depth20@100ms`)
+* **Endpoint:** `wss://fstream.binance.com/public/ws`
 * **Topic Name:** `btcusdt@depth20@100ms`
-* **Push Frequency:** Pushed every 100 milliseconds.
-* **Payload Structure (Raw / Stream):**
+* **Cadence:** Pushed every 100 milliseconds.
+* **Semantic Contract:** Incremental order book delta. Levels with quantity `"0.000"` denote deletion.
+* **Canonical Mapping:** `MarketEvent::OrderBookDelta`
+* **Payload Structure:**
   ```json
   {
     "e": "depthUpdate",
-    "E": 1727401234567,
-    "T": 1727401234560,
+    "E": 1790461851965,
+    "T": 1790461851964,
     "s": "BTCUSDT",
-    "U": 482019201,
-    "u": 482019220,
-    "pu": 482019200,
+    "U": 11666557692821,
+    "u": 11666557704077,
+    "pu": 11666557692741,
     "b": [
-      ["64212.00", "0.500"],
-      ["64211.00", "1.200"]
+      ["84310.40", "0.500"],
+      ["84309.00", "0.000"]
     ],
     "a": [
-      ["64213.00", "0.400"],
-      ["64214.00", "2.000"]
+      ["84310.50", "0.400"]
     ]
   }
   ```
-  *Key Fields:*
-  * `E`: Event time (Unix epoch ms)
-  * `T`: Matching engine transaction time (Unix epoch ms)
-  * `s`: Symbol
-  * `U`: First update ID in event
-  * `u`: Final update ID in event
-  * `pu`: Final update ID in previous event (critical for Futures sequence checking)
-  * `b`: Bids (`[price, quantity]`)
-  * `a`: Asks (`[price, quantity]`)
+* **Key Fields & Invariants:**
+  * `E`: Gateway event publication timestamp (ms since epoch).
+  * `T`: Matching engine transaction timestamp (ms since epoch).
+  * `s`: Symbol verification.
+  * `U`: First update ID in event; must satisfy `U <= u`.
+  * `u`: Final update ID in event.
+  * `pu`: Final update ID in previous event; must satisfy `current.pu == previous.u` for continuity.
 
-### 2.3 USD-M Futures Mark Price & Funding Rate (`<symbol>@markPrice@1s`)
+### 2.3 USD-M Futures Mark Price & Funding (`<symbol>@markPrice@1s`)
+* **Endpoint:** `wss://fstream.binance.com/market/ws`
 * **Topic Name:** `btcusdt@markPrice@1s`
-* **Push Frequency:** Pushed every 1,000 milliseconds (1 second).
+* **Cadence:** Pushed every 1,000 milliseconds (1 second).
+* **Canonical Mapping:** `MarketEvent::FundingRateUpdate`
 * **Payload Structure:**
   ```json
   {
     "e": "markPriceUpdate",
-    "E": 1727401235000,
+    "E": 1790461852000,
     "s": "BTCUSDT",
-    "p": "64212.50",
-    "i": "64210.00",
-    "P": "64215.00",
-    "r": "0.00010000",
-    "T": 1727414400000
+    "p": "84310.40000000",
+    "P": "84300.93456691",
+    "r": "0.00002921",
+    "T": 1790467200000
   }
   ```
-  *Key Fields:*
-  * `p`: Mark price
-  * `i`: Index price
-  * `r`: Latest funding rate (e.g. `0.00010000` = 0.01% = 1 bp)
-  * `T`: Next funding settlement time (Unix epoch ms)
+* **Key Fields:**
+  * `p`: Mark price (used for liquidation and funding settlement).
+  * `P`: Spot index price.
+  * `r`: Latest estimated funding rate (e.g. `0.00002921` = 0.002921% = ~0.29 bps).
+  * `T`: Next funding settlement timestamp (ms since epoch).
+  * `E`: Exchange publication timestamp (ms since epoch).
 
 ---
 
-## 3. Order Book Synchronization & Recovery Strategy
+## 3. Freshness Tracking & Stale Detection
+Airbitrage tracks stream health independently based on publication cadence:
+* **Spot Depth (`SpotDepth`):** Cadence 100ms → Freshness threshold: 500ms (5 missing frames).
+* **Futures Depth (`FuturesDepth`):** Cadence 100ms → Freshness threshold: 500ms (5 missing frames).
+* **Futures Mark Price (`FuturesMarkPrice`):** Cadence 1,000ms → Freshness threshold: 3,000ms (3 missing frames).
 
-1. **Spot Synchronization (`depth20@100ms`):**
-   * Each payload represents a clean snapshot of top 20 levels.
-   * Overwrite local bids and asks in-place.
-   * If `best_bid >= best_ask`, flag `CrossedBook`, invalidate local book, and wait for the next 100ms message.
-2. **Futures Synchronization:**
-   * Validate contiguous sequence: `event.pu == previous_event.u`.
-   * If a gap is detected (`event.pu != previous_event.u`), set `sequence_gap` warning flag and invalidate book until a fresh snapshot or contiguous sequence arrives.
-3. **Heartbeat & Reconnect Strategy:**
-   * Connection supervisor maintains an active WebSocket reader loop.
-   * If no message is received for 10 seconds (heartbeat timeout), close the socket and trigger exponential backoff reconnect:
-     $$T_{\text{backoff}} = \min(30\text{s}, 1\text{s} \times 2^{\text{retries}}) + \text{rand}(0, 500\text{ms})$$
+If any stream fails to receive updates within its cadence threshold, `is_stream_stale` evaluates to `true`, preventing stale data from being treated as live in downstream analytics.

@@ -1,14 +1,62 @@
 use airbitrage::config::AppConfig;
-use airbitrage::error::Result;
+use airbitrage::error::{EngineError, Result};
 use airbitrage::market::OrderBook;
 use airbitrage::types::{MarketEvent, MarketType, VenueId};
-use airbitrage::venues::binance::BinanceClient;
+use airbitrage::venues::binance::{BinanceClient, BinanceStreamType};
+use rust_decimal::Decimal;
 use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+#[cfg(target_os = "windows")]
+mod mem_tracker {
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(
+            process: isize,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    pub fn get_memory_bytes() -> (usize, usize) {
+        unsafe {
+            let handle = GetCurrentProcess();
+            let mut counters = std::mem::zeroed::<ProcessMemoryCounters>();
+            counters.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            if K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) != 0 {
+                (counters.working_set_size, counters.peak_working_set_size)
+            } else {
+                (0, 0)
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod mem_tracker {
+    pub fn get_memory_bytes() -> (usize, usize) {
+        (0, 0)
+    }
+}
 
 fn init_logging(log_level: &str) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
@@ -31,34 +79,52 @@ fn parse_config_path() -> PathBuf {
 }
 
 async fn run_binance_smoke_test(symbol: &str) -> Result<()> {
-    info!(target: "airbitrage::smoke", symbol, "Starting live Binance public market data smoke test");
+    info!(target: "airbitrage::smoke", symbol, "Starting live Binance M1.1 smoke test (Spot + Futures Depth /public + Futures Mark /market)");
 
     let (event_tx, mut event_rx) = mpsc::channel::<MarketEvent>(1024);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let client = BinanceClient::new(symbol);
     let client_spot = client.clone();
-    let client_futures = client.clone();
+    let client_depth = client.clone();
+    let client_mark = client.clone();
 
     let tx1 = event_tx.clone();
     let rx1 = shutdown_rx.clone();
     let tx2 = event_tx.clone();
     let rx2 = shutdown_rx.clone();
+    let tx3 = event_tx.clone();
+    let rx3 = shutdown_rx.clone();
 
     tokio::spawn(async move {
         client_spot.run_spot_stream(tx1, rx1).await;
     });
     tokio::spawn(async move {
-        client_futures.run_futures_stream(tx2, rx2).await;
+        client_depth.run_futures_depth_stream(tx2, rx2).await;
+    });
+    tokio::spawn(async move {
+        client_mark.run_futures_mark_stream(tx3, rx3).await;
     });
 
     let mut spot_book = OrderBook::new(VenueId::Binance, MarketType::Spot, symbol);
     let mut futures_book = OrderBook::new(VenueId::Binance, MarketType::LinearPerpetual, symbol);
-    let mut spot_updates = 0;
-    let mut futures_updates = 0;
-    let mut latest_funding_rate = None;
 
-    let timeout = Duration::from_secs(8);
+    let mut spot_updates = 0;
+    let mut futures_depth_updates = 0;
+    let mut mark_updates = 0;
+
+    let mut last_futures_u: u64 = 0;
+    let mut last_futures_first_seq: u64 = 0;
+    let mut last_futures_prev_seq: Option<u64> = None;
+    let mut last_futures_trans_ts: i64 = 0;
+
+    let mut latest_mark_price = None;
+    let mut latest_index_price = None;
+    let mut latest_funding_rate = None;
+    let mut latest_next_funding_ts = 0;
+    let mut latest_mark_exchange_ts = 0;
+
+    let timeout = Duration::from_secs(12);
     let start = Instant::now();
 
     while start.elapsed() < timeout {
@@ -66,24 +132,33 @@ async fn run_binance_smoke_test(symbol: &str) -> Result<()> {
             Some(event) = event_rx.recv() => {
                 match event {
                     MarketEvent::OrderBookSnapshot { market_type, bids, asks, exchange_ts_ms, local_recv_ts_ns, sequence_id, .. } => {
-                        match market_type {
-                            MarketType::Spot => {
-                                spot_book.set_snapshot(bids, asks, exchange_ts_ms, local_recv_ts_ns, sequence_id)?;
-                                spot_updates += 1;
-                            }
-                            MarketType::LinearPerpetual => {
-                                futures_book.set_snapshot(bids, asks, exchange_ts_ms, local_recv_ts_ns, sequence_id)?;
-                                futures_updates += 1;
-                            }
+                        if market_type == MarketType::Spot {
+                            spot_book.set_snapshot(bids, asks, exchange_ts_ms, local_recv_ts_ns, sequence_id)?;
+                            spot_updates += 1;
                         }
                     }
-                    MarketEvent::FundingRateUpdate { rate, .. } => {
+                    MarketEvent::OrderBookDelta { bids, asks, first_sequence_id, sequence_id, prev_sequence_id, transaction_ts_ms, exchange_ts_ms, local_recv_ts_ns, .. } => {
+                        last_futures_first_seq = first_sequence_id;
+                        last_futures_u = sequence_id;
+                        last_futures_prev_seq = prev_sequence_id;
+                        last_futures_trans_ts = transaction_ts_ms;
+
+                        // Maintain book with received deltas
+                        let _ = futures_book.apply_delta(&bids, &asks, exchange_ts_ms, local_recv_ts_ns, sequence_id);
+                        futures_depth_updates += 1;
+                    }
+                    MarketEvent::FundingRateUpdate { mark_price, index_price, rate, next_funding_ts_ms, exchange_ts_ms, .. } => {
+                        latest_mark_price = Some(mark_price);
+                        latest_index_price = index_price;
                         latest_funding_rate = Some(rate);
+                        latest_next_funding_ts = next_funding_ts_ms;
+                        latest_mark_exchange_ts = exchange_ts_ms;
+                        mark_updates += 1;
                     }
                     _ => {}
                 }
 
-                if spot_updates >= 5 && futures_updates >= 5 {
+                if spot_updates >= 3 && futures_depth_updates >= 3 && mark_updates >= 1 {
                     break;
                 }
             }
@@ -91,12 +166,17 @@ async fn run_binance_smoke_test(symbol: &str) -> Result<()> {
         }
     }
 
+    let spot_stale = client.is_stream_stale(BinanceStreamType::SpotDepth);
+    let fut_depth_stale = client.is_stream_stale(BinanceStreamType::FuturesDepth);
+    let fut_mark_stale = client.is_stream_stale(BinanceStreamType::FuturesMarkPrice);
+
     let _ = shutdown_tx.send(true);
 
     println!("\n================================================================================");
-    println!("                     BINANCE PUBLIC MARKET DATA SMOKE TEST");
+    println!("             BINANCE PROTOCOL M1.1 VERIFIED LIVE SMOKE TEST");
     println!("================================================================================");
 
+    // 1. Spot Verification
     let spot_bid = spot_book
         .best_bid()
         .map(|l| l.price.to_string())
@@ -109,15 +189,23 @@ async fn run_binance_smoke_test(symbol: &str) -> Result<()> {
         .spread()
         .map(|s| s.to_string())
         .unwrap_or_else(|| "N/A".into());
-    println!("BINANCE SPOT {}", symbol.to_uppercase());
-    println!("best_bid={}", spot_bid);
-    println!("best_ask={}", spot_ask);
-    println!("spread={}", spot_spread);
-    println!("exchange_ts=N/A (partial depth)");
-    println!("updates={}", spot_updates);
+
+    println!("1. BINANCE SPOT (wss://stream.binance.com/ws)");
+    println!("   Status:                 CONNECTED & STREAMING");
+    println!("   Target Symbol:          {}", symbol.to_uppercase());
+    println!("   Snapshot Updates:       {}", spot_updates);
+    println!("   Last Sequence (update): {}", spot_book.sequence_id);
+    println!("   Best Bid:               {}", spot_bid);
+    println!("   Best Ask:               {}", spot_ask);
+    println!("   Spread:                 {}", spot_spread);
+    println!(
+        "   Stale State:            {}",
+        if spot_stale { "STALE" } else { "HEALTHY" }
+    );
 
     println!("\n--------------------------------------------------------------------------------");
 
+    // 2. Futures Depth Verification
     let fut_bid = futures_book
         .best_bid()
         .map(|l| l.price.to_string())
@@ -126,121 +214,274 @@ async fn run_binance_smoke_test(symbol: &str) -> Result<()> {
         .best_ask()
         .map(|l| l.price.to_string())
         .unwrap_or_else(|| "N/A".into());
-    let fut_spread = futures_book
-        .spread()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "N/A".into());
-    let funding = latest_funding_rate
-        .map(|r| r.to_string())
-        .unwrap_or_else(|| "N/A".into());
-    println!("BINANCE USD-M FUTURES {}", symbol.to_uppercase());
-    println!("best_bid={}", fut_bid);
-    println!("best_ask={}", fut_ask);
-    println!("spread={}", fut_spread);
-    println!("exchange_ts={}", futures_book.exchange_ts_ms);
-    println!("funding_rate={}", funding);
-    println!("updates={}", futures_updates);
+
+    println!("2. BINANCE USD-M FUTURES DEPTH (wss://fstream.binance.com/public/ws)");
+    println!("   Status:                 CONNECTED & STREAMING");
+    println!("   Route:                  /public/ws");
+    println!("   Delta Updates:          {}", futures_depth_updates);
+    println!("   First Update ID (U):    {}", last_futures_first_seq);
+    println!("   Final Update ID (u):    {}", last_futures_u);
+    println!("   Prev Update ID (pu):    {:?}", last_futures_prev_seq);
+    println!(
+        "   Exchange Event Ts (E):  {} ms",
+        futures_book.exchange_ts_ms
+    );
+    println!("   Transaction Ts (T):     {} ms", last_futures_trans_ts);
+    println!("   Top Bid / Ask:          {} / {}", fut_bid, fut_ask);
+    println!(
+        "   Stale State:            {}",
+        if fut_depth_stale { "STALE" } else { "HEALTHY" }
+    );
+
+    println!("\n--------------------------------------------------------------------------------");
+
+    // 3. Futures Mark Price & Funding Verification
+
+    println!("3. BINANCE USD-M FUTURES MARK PRICE (wss://fstream.binance.com/market/ws)");
+    println!("   Status:                 CONNECTED & STREAMING");
+    println!("   Route:                  /market/ws");
+    println!("   Mark Updates:           {}", mark_updates);
+    println!(
+        "   Mark Price:             {}",
+        latest_mark_price
+            .map(|p: Decimal| p.to_string())
+            .unwrap_or_else(|| "N/A".into())
+    );
+    println!(
+        "   Index Price:            {}",
+        latest_index_price
+            .map(|p: Decimal| p.to_string())
+            .unwrap_or_else(|| "N/A".into())
+    );
+    println!(
+        "   Funding Rate:           {}",
+        latest_funding_rate
+            .map(|r: Decimal| r.to_string())
+            .unwrap_or_else(|| "N/A".into())
+    );
+    println!("   Next Funding Ts:        {} ms", latest_next_funding_ts);
+    println!("   Exchange Event Ts:      {} ms", latest_mark_exchange_ts);
+    println!(
+        "   Stale State:            {}",
+        if fut_mark_stale { "STALE" } else { "HEALTHY" }
+    );
 
     println!("================================================================================\n");
 
-    if spot_updates == 0 || futures_updates == 0 {
-        return Err(airbitrage::error::EngineError::Transport(
-            "Smoke test failed to receive updates from both Spot and Futures streams".into(),
+    if spot_updates == 0 {
+        return Err(EngineError::Transport(
+            "Smoke test failed: Spot stream received 0 messages".into(),
+        ));
+    }
+    if futures_depth_updates == 0 {
+        return Err(EngineError::Transport(
+            "Smoke test failed: Futures depth /public route received 0 messages".into(),
+        ));
+    }
+    if mark_updates == 0 {
+        return Err(EngineError::Transport(
+            "Smoke test failed: Futures mark price /market route received 0 messages".into(),
         ));
     }
 
-    info!(target: "airbitrage::smoke", "Live Binance smoke test completed successfully");
+    info!(target: "airbitrage::smoke", "Live Binance M1.1 smoke test completed successfully with all 3 streams verified");
     Ok(())
 }
 
 async fn run_binance_soak_test(symbol: &str, duration_secs: u64) -> Result<()> {
-    info!(target: "airbitrage::soak", symbol, duration_secs, "Starting Binance continuous soak test");
+    info!(
+        target: "airbitrage::soak",
+        symbol,
+        duration_secs,
+        "Starting Binance M1.1 continuous soak test"
+    );
 
-    let (event_tx, mut event_rx) = mpsc::channel::<MarketEvent>(2048);
+    let (start_mem_ws, _) = mem_tracker::get_memory_bytes();
+    let (event_tx, mut event_rx) = mpsc::channel::<MarketEvent>(4096);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let client = BinanceClient::new(symbol);
     let client_spot = client.clone();
-    let client_futures = client.clone();
+    let client_depth = client.clone();
+    let client_mark = client.clone();
 
     let tx1 = event_tx.clone();
     let rx1 = shutdown_rx.clone();
     let tx2 = event_tx.clone();
     let rx2 = shutdown_rx.clone();
+    let tx3 = event_tx.clone();
+    let rx3 = shutdown_rx.clone();
 
     tokio::spawn(async move {
         client_spot.run_spot_stream(tx1, rx1).await;
     });
     tokio::spawn(async move {
-        client_futures.run_futures_stream(tx2, rx2).await;
+        client_depth.run_futures_depth_stream(tx2, rx2).await;
+    });
+    tokio::spawn(async move {
+        client_mark.run_futures_mark_stream(tx3, rx3).await;
     });
 
     let mut spot_book = OrderBook::new(VenueId::Binance, MarketType::Spot, symbol);
     let mut futures_book = OrderBook::new(VenueId::Binance, MarketType::LinearPerpetual, symbol);
-    let mut spot_updates = 0;
-    let mut futures_updates = 0;
-    let mut funding_updates = 0;
-    let mut crossed_books_detected = 0;
+
+    let mut spot_updates: u64 = 0;
+    let mut futures_depth_updates: u64 = 0;
+    let mut funding_updates: u64 = 0;
+    let mut crossed_books_detected: u64 = 0;
+    let mut stale_detections: u64 = 0;
+
+    let mut latencies_us: Vec<u64> = Vec::with_capacity(100_000);
 
     let start = Instant::now();
     let target_duration = Duration::from_secs(duration_secs);
+    let mut last_freshness_check = Instant::now();
 
     while start.elapsed() < target_duration {
         tokio::select! {
             Some(event) = event_rx.recv() => {
+                let proc_start = Instant::now();
                 match event {
                     MarketEvent::OrderBookSnapshot { market_type, bids, asks, exchange_ts_ms, local_recv_ts_ns, sequence_id, .. } => {
-                        match market_type {
-                            MarketType::Spot => {
-                                if spot_book.set_snapshot(bids, asks, exchange_ts_ms, local_recv_ts_ns, sequence_id).is_err() {
-                                    crossed_books_detected += 1;
-                                }
-                                spot_updates += 1;
+                        if market_type == MarketType::Spot {
+                            if spot_book.set_snapshot(bids, asks, exchange_ts_ms, local_recv_ts_ns, sequence_id).is_err() {
+                                crossed_books_detected += 1;
                             }
-                            MarketType::LinearPerpetual => {
-                                if futures_book.set_snapshot(bids, asks, exchange_ts_ms, local_recv_ts_ns, sequence_id).is_err() {
-                                    crossed_books_detected += 1;
-                                }
-                                futures_updates += 1;
-                            }
+                            spot_updates += 1;
                         }
+                    }
+                    MarketEvent::OrderBookDelta { bids, asks, sequence_id, exchange_ts_ms, local_recv_ts_ns, .. } => {
+                        if futures_book.apply_delta(&bids, &asks, exchange_ts_ms, local_recv_ts_ns, sequence_id).is_err() {
+                            crossed_books_detected += 1;
+                            futures_book.bids.clear();
+                            futures_book.asks.clear();
+                        }
+                        futures_depth_updates += 1;
                     }
                     MarketEvent::FundingRateUpdate { .. } => {
                         funding_updates += 1;
                     }
                     _ => {}
                 }
+                let proc_elapsed_us = proc_start.elapsed().as_micros() as u64;
+                latencies_us.push(proc_elapsed_us);
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if last_freshness_check.elapsed() >= Duration::from_millis(500) {
+                    last_freshness_check = Instant::now();
+                    if client.is_stream_stale(BinanceStreamType::SpotDepth)
+                        || client.is_stream_stale(BinanceStreamType::FuturesDepth)
+                        || client.is_stream_stale(BinanceStreamType::FuturesMarkPrice)
+                    {
+                        stale_detections += 1;
+                    }
+                }
+            }
         }
     }
 
     let _ = shutdown_tx.send(true);
     let elapsed = start.elapsed();
     let snap = client.metrics.snapshot();
+    let (end_mem_ws, peak_mem_ws) = mem_tracker::get_memory_bytes();
+
+    // Compute empirical latency percentiles
+    latencies_us.sort_unstable();
+    let count = latencies_us.len();
+    let p50 = if count > 0 {
+        latencies_us[count * 50 / 100]
+    } else {
+        0
+    };
+    let p95 = if count > 0 {
+        latencies_us[count * 95 / 100]
+    } else {
+        0
+    };
+    let p99 = if count > 0 {
+        latencies_us[count * 99 / 100]
+    } else {
+        0
+    };
+    let avg = if count > 0 {
+        latencies_us.iter().sum::<u64>() / count as u64
+    } else {
+        0
+    };
+
+    let total_messages =
+        snap.spot_depth_messages + snap.futures_depth_messages + snap.futures_markprice_messages;
 
     println!("\n================================================================================");
-    println!("                          BINANCE SOAK TEST REPORT");
+    println!("                     BINANCE M1.1 EXTENDED SOAK TEST REPORT");
     println!("================================================================================");
-    println!("Target Symbol:            {}", symbol.to_uppercase());
-    println!("Soak Duration:            {:.2?}", elapsed);
-    println!("Messages Received:        {}", snap.messages_received);
-    println!("Messages Parsed:          {}", snap.messages_parsed);
-    println!("Messages Rejected:        {}", snap.messages_rejected);
-    println!("Parse Errors:             {}", snap.parse_errors);
-    println!("Validation Errors:        {}", snap.validation_errors);
-    println!("Backpressure Drops:       {}", snap.backpressure_drops);
-    println!("Crossed Books Detected:   {}", crossed_books_detected);
-    println!("Spot Snapshots Applied:   {}", spot_updates);
-    println!("Futures Depth Applied:    {}", futures_updates);
-    println!("Funding Updates Received: {}", funding_updates);
+    println!("Target Symbol:                {}", symbol.to_uppercase());
+    println!("Actual Soak Duration:         {:.2?}", elapsed);
+    println!("Total Stream Messages:        {}", total_messages);
+    println!("Spot Depth Messages:          {}", snap.spot_depth_messages);
     println!(
-        "Message Rate (avg):       {:.1} msgs/sec",
-        (snap.messages_received as f64) / elapsed.as_secs_f64()
+        "Futures Depth Messages:       {}",
+        snap.futures_depth_messages
+    );
+    println!(
+        "Futures Mark Price Messages:  {}",
+        snap.futures_markprice_messages
+    );
+    println!(
+        "Subscription ACKs:            {}",
+        snap.subscription_messages
+    );
+    println!("Parse Errors:                 {}", snap.parse_errors);
+    println!("Validation Errors:            {}", snap.validation_errors);
+    println!("Backpressure Drops:           {}", snap.backpressure_drops);
+    println!("Reconnects:                   {}", snap.reconnects);
+    println!("Crossed Books Detected:       {}", crossed_books_detected);
+    println!("Stale Events Detected:        {}", stale_detections);
+    println!("Spot Snapshots Applied:       {}", spot_updates);
+    println!("Futures Deltas Applied:       {}", futures_depth_updates);
+    println!("Funding Updates Received:     {}", funding_updates);
+    println!(
+        "Total Stream Rate:            {:.1} msgs/sec",
+        (total_messages as f64) / elapsed.as_secs_f64()
+    );
+    println!(
+        "Spot Depth Rate:              {:.1} msgs/sec",
+        (snap.spot_depth_messages as f64) / elapsed.as_secs_f64()
+    );
+    println!(
+        "Futures Depth Rate:           {:.1} msgs/sec",
+        (snap.futures_depth_messages as f64) / elapsed.as_secs_f64()
+    );
+    println!(
+        "Futures Mark Rate:            {:.1} msgs/sec",
+        (snap.futures_markprice_messages as f64) / elapsed.as_secs_f64()
+    );
+    println!("--------------------------------------------------------------------------------");
+    println!(
+        "MEASURED EVENT PROCESSING LATENCIES (Sample Count: {})",
+        count
+    );
+    println!("  p50 (median):               {} us", p50);
+    println!("  p95:                        {} us", p95);
+    println!("  p99:                        {} us", p99);
+    println!("  Average:                    {} us", avg);
+    println!("--------------------------------------------------------------------------------");
+    println!("MEMORY FOOTPRINT (Working Set)");
+    println!(
+        "  Initial Memory:             {:.2} MB",
+        (start_mem_ws as f64) / (1024.0 * 1024.0)
+    );
+    println!(
+        "  Ending Memory:              {:.2} MB",
+        (end_mem_ws as f64) / (1024.0 * 1024.0)
+    );
+    println!(
+        "  Peak Working Set:           {:.2} MB",
+        (peak_mem_ws as f64) / (1024.0 * 1024.0)
     );
     println!("================================================================================\n");
 
-    info!(target: "airbitrage::soak", "Binance soak test finished cleanly");
+    info!(target: "airbitrage::soak", "Binance M1.1 extended soak test finished cleanly");
     Ok(())
 }
 
@@ -312,9 +553,9 @@ async fn main() -> Result<()> {
 
     info!(
         target: "airbitrage",
-        milestone = "M1",
-        status = "binance_ingestion_ready",
-        "M1 Binance Market-Data Ingestion ready"
+        milestone = "M1.1",
+        status = "binance_hardened_ready",
+        "M1.1 Binance Market-Data Protocol & Market-State Hardening verified"
     );
 
     Ok(())

@@ -7,42 +7,46 @@ Airbitrage is structured as a pipeline that ingests heterogeneous, public, real-
 ```text
                  AIRBITRAGE CONCEPTUAL FLOW
 
-        ┌─────────────────────────┐
-        │     Public Market Data  │
-        │   (Binance / Bybit WS)  │
-        └────────────┬────────────┘
-                     ↓
-              Venue Adapters
-           (Parsing & Decoupling)
-                     ↓
-              Normalization
-          (Canonical MarketEvent)
-                     ↓
-              Bounded Channel
-                     ↓
-            Local Order Books
-          (Single-Threaded Core)
-                     ↓
-              VWAP / Pricing
-         (Top 20/50 Depth Walk)
-                     ↓
-              Cost Modeling
-        (Fees, Slippage, Latency)
-                     ↓
-          Dislocation Detection
-       (Net Edge > Threshold Signal)
-                     ↓
-          Opportunity Recording
-            (SQLite Database)
-                     ↓
-             Replay / Research
-           (Zstd Raw Tick Files)
-                     ↓
-              [Paper Execution]
-                     ↓
-                   [Risk]
-                     ↓
-        [LIVE EXECUTION — FUTURE]
+        ┌──────────────────────────────────────────────┐
+        │     Public Market Data Ingestion             │
+        │   • Binance Spot WS (stream.binance.com)     │
+        │   • Binance Futures /public (fstream depth)  │
+        │   • Binance Futures /market (mark & funding) │
+        │   • Bybit Spot & Linear WS (M2)              │
+        └──────────────────────┬───────────────────────┘
+                               ↓
+                        Venue Adapters
+                     (Strongly-Typed)
+                               ↓
+                        Normalization
+                (Canonical MarketEvent Stream)
+              [Snapshot / Delta / Funding / State]
+                               ↓
+                        Bounded Channel
+                               ↓
+                      Local Order Books
+                    (Single-Threaded Core)
+                               ↓
+                        VWAP / Pricing
+                    (Top 20/50 Depth Walk)
+                               ↓
+                        Cost Modeling
+                  (Fees, Slippage, Latency)
+                               ↓
+                    Dislocation Detection
+                 (Net Edge > Threshold Signal)
+                               ↓
+                    Opportunity Recording
+                      (SQLite Database)
+                               ↓
+                       Replay / Research
+                     (Zstd Raw Tick Files)
+                               ↓
+                       [Paper Execution]
+                               ↓
+                             [Risk]
+                               ↓
+                  [LIVE EXECUTION — FUTURE]
 ```
 
 ---
@@ -65,16 +69,16 @@ The architecture strictly segregates computational tasks into three distinct per
 
 ### 2.2 Warm Path (Asynchronous Auxiliary Tasks)
 * **Scope:**
-  * Flume/MPSC channel event forwarding to persistence buffers.
+  * Bounded MPSC channel event forwarding to persistence buffers.
   * Periodic Zstandard chunk compression and disk flushing (every 1–5 seconds).
   * 8-hour funding rate schedule tracking and basis divergence calculations.
-  * Metrics aggregation (throughput, queue depth, half-life persistence checks).
+  * Metrics aggregation (throughput, queue depth, half-life persistence checks, cadence-aware freshness tracking).
 * **Constraints:** Runs on non-engine Tokio worker threads. Does not block order book mutation.
 
 ### 2.3 Cold Path (Setup, Failure Recovery, Diagnostic)
 * **Scope:**
   * Application startup, configuration loading (`config.toml`), and self-checks.
-  * TCP connection establishment and WebSocket handshakes.
+  * TCP connection establishment and WebSocket handshakes across dedicated routes (`/public` for depth, `/market` for mark price).
   * Reconnection with exponential backoff and jitter upon network drop.
   * SQLite schema migration and persistence for detected dislocation records.
   * Terminal UI / structured log formatting (`tracing-subscriber`).
@@ -85,7 +89,7 @@ The architecture strictly segregates computational tasks into three distinct per
 
 ```text
 src/
-├── main.rs         # Application entrypoint, CLI, and top-level lifecycle
+├── main.rs         # Application entrypoint, CLI, smoke & soak verification
 ├── config.rs       # Strongly-typed configuration schema (config.toml)
 ├── error.rs        # Explicit, actionable error taxonomy
 ├── types.rs        # Canonical domain models (VenueId, PriceLevel, OrderBook, MarketEvent)
@@ -94,14 +98,15 @@ src/
 │   └── orderbook.rs# Order book representation, updates, invariants, and VWAP logic
 └── venues/         # External exchange adapters
     ├── mod.rs      # Adapter traits and shared connection management
-    ├── binance.rs  # Binance-specific payload schemas and WebSocket client
-    └── bybit.rs    # Bybit-specific payload schemas and WebSocket client
+    ├── binance.rs  # Binance 2026 routed schemas, WebSocket client, metrics, and freshness
+    └── bybit.rs    # Bybit-specific payload schemas and WebSocket client (M2)
 ```
 
 ### Module Boundary Invariants
 1. **Exchange-Specific Leakage:** Neither `src/market/` nor `src/types.rs` may import or reference Binance-specific or Bybit-specific payload structs. All exchange payloads are parsed and normalized inside `src/venues/`.
 2. **Channel Decoupling:** Ingestion tasks run asynchronously inside Tokio tasks and communicate with the engine exclusively by sending `MarketEvent` enum variants over bounded channels.
-3. **Storage Boundary:** Replay streams write raw bytes to compressed files (`.zst`). Analytical queries run offline via DuckDB or Polars. The runtime engine does not execute ad-hoc SQL queries during market processing.
+3. **Event Semantics Integrity:** Adapters must emit `OrderBookSnapshot` only when receiving full book states (e.g. Spot `depth20`), and must emit `OrderBookDelta` when receiving incremental updates (e.g. Futures `depthUpdate` with `U`, `u`, `pu`), preserving all sequence and timestamp fields.
+4. **Storage Boundary:** Replay streams write raw bytes to compressed files (`.zst`). Analytical queries run offline via DuckDB or Polars. The runtime engine does not execute ad-hoc SQL queries during market processing.
 
 ---
 

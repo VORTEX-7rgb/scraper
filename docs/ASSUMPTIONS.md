@@ -6,12 +6,22 @@ This register documents every core assumption, design decision, hypothesis, and 
 
 ## 1. Verified Facts (FACT)
 
-* **FACT-01: Public WebSocket Authentication.** Binance Spot (`wss://stream.binance.com:9443/ws`), Binance USD-M Futures (`wss://fstream.binance.com/ws`), Bybit Spot (`wss://stream.bybit.com/v5/public/spot`), and Bybit Linear (`wss://stream.bybit.com/v5/public/linear`) allow unauthenticated, read-only WebSocket connections for public market data without API credentials or KYC.
-  * *Source:* Official Binance Spot WebSocket API Docs; Bybit V5 Public WebSocket Overview.
+* **FACT-01: Public WebSocket Endpoints & Routing Architecture.**
+  * Binance Spot: `wss://stream.binance.com/ws` (TLS port 443). Port 9443 is blocked on certain residential ISPs/firewalls.
+  * Binance USD-M Futures (2026 Routed Architecture):
+    * Public Depth Route: `wss://fstream.binance.com/public/ws` (`<symbol>@depth20@100ms`).
+    * Market Data Route: `wss://fstream.binance.com/market/ws` (`<symbol>@markPrice@1s`).
+    * Legacy unrouted endpoint `wss://fstream.binance.com/ws` is retired. Subscribing to `@markPrice` on `/public` or unrouted URLs fails silently.
+  * Bybit Spot: `wss://stream.bybit.com/v5/public/spot`.
+  * Bybit Linear Futures: `wss://stream.bybit.com/v5/public/linear`.
+  * All listed streams allow unauthenticated, read-only WebSocket connections without API credentials or KYC.
+  * *Source:* Official Binance Spot & USD-M Futures Documentation (Verified September 2026); Bybit V5 Public WebSocket Overview.
 * **FACT-02: Binance Spot REST Weight Scaling.** Calling `GET /api/v3/depth` consumes IP request weight scaling non-linearly with limit: limit 1–100 consumes 5 weight points; limit 501–1000 consumes 50 weight points. Rapid REST snapshot requests during reconnect loops can trigger HTTP 429 rate limit bans.
   * *Source:* Binance Official Spot API Documentation.
-* **FACT-03: Binance Depth Sequencing Asymmetry.** Binance Spot depth deltas provide update range `[U, u]` requiring synchronization with REST snapshot `lastUpdateId`. Binance USD-M Futures diff depth stream provides `pu` (previous update ID) requiring `event.pu == previous_event.u`. The sequencing contracts between Spot and Futures are distinct.
-  * *Source:* Binance Developers Documentation (Derivatives & Spot).
+* **FACT-03: Order Book Event Semantics & Sequencing.**
+  * Binance Spot partial depth (`@depth20@100ms`) provides an explicit snapshot of top 20 levels (`lastUpdateId`, `bids`, `asks`). Mapped to `MarketEvent::OrderBookSnapshot`.
+  * Binance USD-M Futures depth (`@depth20@100ms`) provides an incremental delta update (`depthUpdate`) with sequence IDs `U` (first update ID), `u` (final update ID), and `pu` (previous update ID), alongside transaction timestamp `T` and gateway event timestamp `E`. Mapped to `MarketEvent::OrderBookDelta`. Continuity requires `current.pu == previous.u` and `U <= u`.
+  * *Source:* Binance Developers Derivatives WebSocket Documentation.
 * **FACT-04: Bybit V5 Initial Snapshot.** Subscribing to Bybit V5 orderbook topics (`orderbook.50.<symbol>`) automatically sends an initial message with `"type": "snapshot"`. A separate REST orderbook request is not required for WebSocket initialization.
   * *Source:* Bybit V5 Public WebSocket Orderbook Specification.
 * **FACT-05: Baseline Retail Fee Schedules.** Non-VIP retail taker fees are:
@@ -26,8 +36,15 @@ This register documents every core assumption, design decision, hypothesis, and 
   * *Source:* Government of India Finance Act; Income Tax Department Circulars.
 * **FACT-08: Binance WebSocket Transport Port.** Connecting to Binance Spot via port 9443 (`stream.binance.com:9443`) fails on certain residential ISPs/firewalls. Standard TLS port 443 (`wss://stream.binance.com/ws`) is fully accessible and verified.
   * *Source:* Direct network socket probe and successful live WebSocket handshake.
-* **FACT-09: Empirical Feed Throughput.** Subscribing to BTCUSDT Spot `depth20@100ms` and USD-M Futures `depth20@100ms` generates a combined throughput of ~18 messages per second with zero dropped or malformed frames under normal market conditions.
-  * *Source:* Live 15-second soak test execution.
+* **FACT-09: Empirical Stream Throughput & Ingestion Latencies (Measured M1.1 60s Soak).**
+  * Subscribing to BTCUSDT Spot `depth20@100ms`, USD-M Futures depth `depth20@100ms` (`/public`), and Mark Price `markPrice@1s` (`/market`):
+    * Duration: 60.00 seconds.
+    * Total stream messages: 1,126 (590 Spot depth, 477 Futures depth, 59 Mark Price).
+    * Total throughput: ~18.8 msgs/sec (Spot: 9.8 msgs/sec, Futures depth: 7.9 msgs/sec, Mark Price: 1.0 msgs/sec).
+    * Errors: 0 parse errors, 0 validation errors, 0 backpressure drops, 0 disconnects, 0 crossed books.
+    * Processing latency: p50: 8 µs, p95: 39 µs, p99: 46 µs, average: 17 µs.
+    * Memory working set: 7.27 MB initial, 14.93 MB ending, 15.12 MB peak working set.
+  * *Source:* Live 60-second continuous soak test execution (`--binance-soak 60`).
 
 ---
 
@@ -40,6 +57,7 @@ This register documents every core assumption, design decision, hypothesis, and 
 * **DEC-05: Multi-Tiered Storage Separation.** Raw tick streams are logged to append-only Zstandard-compressed files for deterministic replay. Detected opportunities ($\text{Net Edge} > 0$) are recorded in a local SQLite database. High-throughput time-series databases (ClickHouse) are deferred.
 * **DEC-06: Message-Driven Enum Venue Abstraction.** Venue adapters emit standardized `MarketEvent` enum variants over channels rather than dynamic trait objects (`Box<dyn VenueAdapter>`), avoiding heap allocation and runtime vtable indirection.
 * **DEC-07: Monotonic Clock for Latency Tracking.** Monotonic `std::time::Instant` is used exclusively for internal latency delta calculations ($\Delta t = t_1 - t_0$). Wall-clock timestamps (Unix epoch nanoseconds) are recorded separately for logging and correlation.
+* **DEC-08: Cadence-Aware Stream Freshness.** Stream staleness thresholds are calibrated to nominal publication intervals: 500ms for 100ms depth streams, 3,000ms for 1,000ms mark price streams.
 
 ---
 
@@ -56,7 +74,7 @@ This register documents every core assumption, design decision, hypothesis, and 
 
 *These are engineering targets to be verified through criterion benchmarks in later milestones; they are NOT claims of current performance.*
 
-* **TGT-01:** WebSocket frame JSON parsing and normalization into `MarketEvent`: $< 25\,\mu\text{s}$ per message.
+* **TGT-01:** WebSocket frame JSON parsing and normalization into `MarketEvent`: $< 25\,\mu\text{s}$ per message (Measured: p50 8 µs, p99 46 µs).
 * **TGT-02:** Local order book mutation (in-place top-20 update): $< 5\,\mu\text{s}$.
 * **TGT-03:** Executable VWAP calculation across 20 depth levels: $< 5\,\mu\text{s}$.
 * **TGT-04:** Tick-to-detection latency (socket receipt to dislocation evaluation): $< 50\,\mu\text{s}$.

@@ -72,22 +72,30 @@ pub enum MarketEvent {
         sequence_id: u64,
     },
     /// Incremental level updates. Quantity == 0 denotes level deletion.
+    /// Preserves exchange update sequence identifiers (`U`, `u`, `pu`) and transaction timestamps.
     OrderBookDelta {
         venue: VenueId,
         market_type: MarketType,
         symbol: String,
         bids: Vec<PriceLevel>,
         asks: Vec<PriceLevel>,
+        first_sequence_id: u64,
+        sequence_id: u64,
+        prev_sequence_id: Option<u64>,
+        transaction_ts_ms: i64,
         exchange_ts_ms: i64,
         local_recv_ts_ns: i64,
-        sequence_id: u64,
     },
-    /// Perpetual funding rate update.
+    /// Perpetual mark price and funding rate update.
     FundingRateUpdate {
         venue: VenueId,
         symbol: String,
+        mark_price: Decimal,
+        index_price: Option<Decimal>,
         rate: Decimal,
         next_funding_ts_ms: i64,
+        exchange_ts_ms: i64,
+        local_recv_ts_ns: i64,
     },
     /// Connection state lifecycle event.
     ConnectionState {
