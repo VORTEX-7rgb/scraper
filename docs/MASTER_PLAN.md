@@ -5,17 +5,16 @@ This document defines the complete phased engineering roadmap for Airbitrage. Ea
 ---
 
 ## Current Status Overview
-* **Active Milestone:** Phase 1 (M1 Binance Market Data)
-* **M0 STATUS: COMPLETE**
-* **Rust Version:** `rustc 1.98.1 (48a229cea 2026-09-01)`
-* **Cargo Version:** `cargo 1.98.1 (797e8a9bc 2026-08-05)`
-* **Rust Edition:** `2024`
-* **OS:** Windows 11 (`x86_64-pc-windows-msvc`)
+* **Active Milestone:** Phase 2 (M2 Bybit Market Data)
+* **M0 STATUS: COMPLETE** (Foundation & Project Scaffolding)
+* **M1 STATUS: COMPLETE** (Binance Public Market-Data Ingestion)
+* **Rust Version:** `rustc 1.98.1 (48a229cea 2026-09-01)` / Edition `2024`
 * **Cargo Check:** PASSED (0 errors, 0 warnings)
-* **Cargo Test:** PASSED (7 passed; 0 failed; 0 ignored)
+* **Cargo Test:** PASSED (19 passed; 0 failed; 0 ignored across M0 and M1 test suites)
 * **Cargo Clippy:** PASSED (`--all-targets --all-features -- -D warnings`, 0 warnings)
 * **Cargo Fmt:** PASSED (`cargo fmt --check`, 0 diffs)
-* **Git Status:** Clean baseline staged for initial commit
+* **Live Smoke Test:** PASSED (Binance Spot & USD-M Futures streams connected and parsed live quotes)
+* **Live Soak Test:** PASSED (15s continuous run: 269 messages received, 267 parsed, 0 rejected, 0 errors, 0 crossed books)
 
 ---
 

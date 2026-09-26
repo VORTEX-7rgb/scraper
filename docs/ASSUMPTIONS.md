@@ -24,6 +24,10 @@ This register documents every core assumption, design decision, hypothesis, and 
   * *Source:* Local host command verification (`rustc --version`, `cargo --version`).
 * **FACT-07: Indian Taxation Asymmetry.** Under Income Tax Act Section 115BBH, Virtual Digital Assets (VDAs) are taxed at a flat 30% without loss setoff across transactions or legs. Section 194S requires 1% TDS on turnover.
   * *Source:* Government of India Finance Act; Income Tax Department Circulars.
+* **FACT-08: Binance WebSocket Transport Port.** Connecting to Binance Spot via port 9443 (`stream.binance.com:9443`) fails on certain residential ISPs/firewalls. Standard TLS port 443 (`wss://stream.binance.com/ws`) is fully accessible and verified.
+  * *Source:* Direct network socket probe and successful live WebSocket handshake.
+* **FACT-09: Empirical Feed Throughput.** Subscribing to BTCUSDT Spot `depth20@100ms` and USD-M Futures `depth20@100ms` generates a combined throughput of ~18 messages per second with zero dropped or malformed frames under normal market conditions.
+  * *Source:* Live 15-second soak test execution.
 
 ---
 

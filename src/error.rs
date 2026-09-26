@@ -30,6 +30,12 @@ pub enum EngineError {
 
     #[error("Data quality error: {0}")]
     DataQuality(String),
+
+    #[error("Transport/Network error: {0}")]
+    Transport(String),
+
+    #[error("WebSocket error: {0}")]
+    WebSocket(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
