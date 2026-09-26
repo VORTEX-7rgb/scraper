@@ -1,0 +1,32 @@
+# Airbitrage V1 Configuration (Public Research Mode)
+# No API keys or credentials exist in this system.
+
+[app]
+name = "airbitrage"
+environment = "development"
+log_level = "info"
+
+[storage]
+data_dir = "data"
+sqlite_path = "data/airbitrage_events.db"
+zstd_raw_dir = "data/raw_ticks"
+
+[engine]
+# Minimum gross spread threshold (in basis points) required to trigger a dislocation record
+min_spread_bps = 5.0
+# Sizing tiers for VWAP depth walking in USD notional
+test_notional_tiers = [100.0, 500.0, 1000.0]
+# Maximum acceptable order book age before marking as stale (in milliseconds)
+max_book_age_ms = 1000
+
+[[venues]]
+id = "binance"
+enabled = true
+symbols = ["BTCUSDT"]
+market_types = ["spot", "linear_perpetual"]
+
+[[venues]]
+id = "bybit"
+enabled = true
+symbols = ["BTCUSDT"]
+market_types = ["spot", "linear_perpetual"]

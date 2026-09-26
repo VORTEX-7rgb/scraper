@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+Cargo.lock.backup
+
+# Configuration overrides & local data
+*.env
+*.log
+data/
+*.db
+*.db-journal
+*.zst
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+[Dd]esktop.ini

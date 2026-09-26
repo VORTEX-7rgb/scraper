@@ -1,0 +1,33 @@
+[package]
+name = "airbitrage"
+version = "0.1.0"
+edition = "2024"
+authors = ["Airbitrage Contributors"]
+description = "Market Dislocation Research Observatory and Analysis Engine"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Serialization & Config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Numerical Precision for Financial Data
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+
+# Structured Error Handling
+thiserror = "2.0"
+
+# Structured Diagnostic Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+rust_decimal_macros = "1.36"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
