@@ -89,17 +89,19 @@ The architecture strictly segregates computational tasks into three distinct per
 
 ```text
 src/
-├── main.rs         # Application entrypoint, CLI, smoke & soak verification
+├── main.rs         # Application entrypoint, CLI, smoke, soak, and live state verification
 ├── config.rs       # Strongly-typed configuration schema (config.toml)
 ├── error.rs        # Explicit, actionable error taxonomy
 ├── types.rs        # Canonical domain models (VenueId, PriceLevel, OrderBook, MarketEvent)
-├── market/         # Domain engine
-│   ├── mod.rs      # Market module interface
-│   └── orderbook.rs# Order book representation, updates, invariants, and VWAP logic
+├── market/         # Local Market-State Engine (M2)
+│   ├── mod.rs      # Market module interface and re-exports
+│   ├── orderbook.rs# Order book representation, updates, invariants, and sorting logic
+│   ├── state.rs    # Book lifecycle state machine, sequence continuity, snapshot/delta alignment
+│   └── manager.rs  # Multi-book state manager, event router, and safe query interface
 └── venues/         # External exchange adapters
     ├── mod.rs      # Adapter traits and shared connection management
     ├── binance.rs  # Binance 2026 routed schemas, WebSocket client, metrics, and freshness
-    └── bybit.rs    # Bybit-specific payload schemas and WebSocket client (M2)
+    └── bybit.rs    # Bybit-specific payload schemas and WebSocket client (M3)
 ```
 
 ### Module Boundary Invariants
@@ -139,3 +141,84 @@ src/
 
 * **Deterministic Replay Guarantee:** Because the order book core consumes `MarketEvent` streams without querying system clocks for internal logic, a historical recording played back through the channel produces the exact same sequence of order book states and dislocation calculations as live streaming.
 * **Execution Boundary:** The execution engine (simulated in V1, live in future phases) sits downstream of the Dislocation Detector and Risk Engine. It receives `ExecutionIntent` and cannot bypass risk checks or order book validation rules.
+
+---
+
+## 5. Local Market-State Engine Architecture (M2)
+
+The Local Market-State Engine (`src/market/state.rs`, `src/market/manager.rs`) is the deterministic, venue-agnostic foundation that consumes canonical `MarketEvent`s, reconstructs order books, enforces sequence continuity, suppresses duplicates and stale updates, detects crossed books, and exposes trusted market states for downstream pricing and dislocation engines.
+
+### 5.1 Architecture & Flow
+
+```text
+                  MarketEvent
+                      │
+                      ▼
+             MarketStateManager
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+   Binance Spot Book       Binance Futures Book
+   (Snapshot-Driven)       (Delta-Driven)
+          │                       │
+          ▼                       ▼
+    BookValidity            SequenceValidity
+   (Crossed/Stale)         (pu == previous.u)
+          │                       │
+          └───────────┬───────────┘
+                      │
+                      ▼
+             Trusted Market State
+         (Only if Live, Valid, Non-Stale)
+```
+
+### 5.2 Explicit 6-State Lifecycle Machine
+
+```text
+      ┌──────────┐
+      │  Empty   │
+      └────┬─────┘
+           │ register
+           ▼
+┌──────────────────────┐
+│   AwaitingSnapshot   │◄─────────────────────────┐
+└──────────┬───────────┘                          │
+           │ snapshot arrives                     │
+           ▼                                      │
+┌──────────────────────┐                          │
+│    Synchronizing     │                          │
+└──────────┬───────────┘                          │
+           │ deltas aligned                       │
+           ▼                                      │ resync cycle
+┌──────────────────────┐                          │
+│         Live         │                          │
+└──────────┬───────────┘                          │
+           │ sequence gap / crossed book / drop   │
+           ▼                                      │
+┌──────────────────────┐                          │
+│     Invalidated      │                          │
+└──────────┬───────────┘                          │
+           │ request_resync                       │
+           ▼                                      │
+┌──────────────────────┐                          │
+│      Resyncing       ├──────────────────────────┘
+└──────────────────────┘
+```
+
+* **Trust Invariant:** Downstream consumers calling `MarketStateManager::get_trusted_book` only receive `Some(&OrderBook)` when:
+  1. Lifecycle state is strictly `BookLifecycleState::Live`.
+  2. Validity is strictly `BookValidity::Valid`.
+  3. Internal order book is uncrossed (`best_bid < best_ask`).
+  4. Local receive age is within the configured freshness threshold ($\Delta t \le \tau_{\text{staleness}}$).
+
+### 5.3 Binance USD-M Futures Synchronization Protocol
+
+1. **Delta Buffering:** During `AwaitingSnapshot` and `Synchronizing`, incoming WebSocket depth updates (`depthUpdate`) are queued in a FIFO buffer (`delta_buffer`).
+2. **Snapshot Acquisition:** REST depth snapshot is fetched from `https://fapi.binance.com/fapi/v1/depth?symbol=<symbol>&limit=50`, providing baseline levels and snapshot sequence ID $S = \text{lastUpdateId}$.
+3. **Obsolete Drop:** All buffered events with final update ID $u < S$ are discarded.
+4. **Initial Covering Alignment:** The first valid event is identified where $(U \le S \le u)$ or $(pu = S \lor U = S + 1)$.
+5. **Sequential Drainage:** Subsequent buffered deltas are applied in order, validating continuity: $pu == \text{current } u$.
+6. **Live Continuity:** For subsequent live updates:
+   - Duplicates ($u == \text{last } u$) and stale updates ($u < \text{last } u$) are discarded without mutating the book.
+   - Stream continuity ($pu == \text{last } u$) is strictly checked. Any gap transitions the book to `Invalidated` with `InvalidationReason::SequenceGap`.

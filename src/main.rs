@@ -1,7 +1,7 @@
 use airbitrage::config::AppConfig;
 use airbitrage::error::{EngineError, Result};
-use airbitrage::market::OrderBook;
-use airbitrage::types::{MarketEvent, MarketType, VenueId};
+use airbitrage::market::{MarketStateManager, OrderBook};
+use airbitrage::types::{MarketEvent, MarketType, PriceLevel, VenueId};
 use airbitrage::venues::binance::{BinanceClient, BinanceStreamType};
 use rust_decimal::Decimal;
 use std::env;
@@ -485,12 +485,373 @@ async fn run_binance_soak_test(symbol: &str, duration_secs: u64) -> Result<()> {
     Ok(())
 }
 
+fn fetch_binance_futures_snapshot(symbol: &str) -> Result<MarketEvent> {
+    let url = format!(
+        "https://fapi.binance.com/fapi/v1/depth?symbol={}&limit=50",
+        symbol.to_uppercase()
+    );
+    let output = std::process::Command::new("curl.exe")
+        .args([
+            "--ssl-no-revoke",
+            "-sS",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "10",
+            &url,
+        ])
+        .output()
+        .map_err(|e| EngineError::Transport(e.to_string()))?;
+
+    if !output.status.success() {
+        return Err(EngineError::Transport(format!(
+            "Failed to fetch Futures depth snapshot: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let raw: serde_json::Value = serde_json::from_str(&stdout_str)?;
+    let last_update_id = raw["lastUpdateId"].as_u64().ok_or_else(|| {
+        EngineError::DataQuality("Missing lastUpdateId in Futures snapshot".into())
+    })?;
+    let exchange_ts = raw["E"].as_i64().unwrap_or(0);
+
+    let raw_bids = raw["bids"]
+        .as_array()
+        .ok_or_else(|| EngineError::DataQuality("Missing bids in Futures snapshot".into()))?;
+    let raw_asks = raw["asks"]
+        .as_array()
+        .ok_or_else(|| EngineError::DataQuality("Missing asks in Futures snapshot".into()))?;
+
+    let mut bids = Vec::with_capacity(raw_bids.len());
+    for item in raw_bids {
+        if let (Some(p_str), Some(q_str)) = (item[0].as_str(), item[1].as_str())
+            && let (Ok(p), Ok(q)) = (p_str.parse::<Decimal>(), q_str.parse::<Decimal>())
+        {
+            bids.push(PriceLevel::new(p, q));
+        }
+    }
+
+    let mut asks = Vec::with_capacity(raw_asks.len());
+    for item in raw_asks {
+        if let (Some(p_str), Some(q_str)) = (item[0].as_str(), item[1].as_str())
+            && let (Ok(p), Ok(q)) = (p_str.parse::<Decimal>(), q_str.parse::<Decimal>())
+        {
+            asks.push(PriceLevel::new(p, q));
+        }
+    }
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+
+    Ok(MarketEvent::OrderBookSnapshot {
+        venue: VenueId::Binance,
+        market_type: MarketType::LinearPerpetual,
+        symbol: symbol.to_uppercase(),
+        bids,
+        asks,
+        exchange_ts_ms: exchange_ts,
+        local_recv_ts_ns: now_ns,
+        sequence_id: last_update_id,
+    })
+}
+
+async fn run_market_state_live_test(symbol: &str, duration_secs: u64) -> Result<()> {
+    info!(
+        target: "airbitrage::state_live",
+        symbol,
+        duration_secs,
+        "Starting local MarketStateManager live validation test"
+    );
+
+    let (event_tx, mut event_rx) = mpsc::channel::<MarketEvent>(4096);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let client = BinanceClient::new(symbol);
+    let client_spot = client.clone();
+    let client_depth = client.clone();
+    let client_mark = client.clone();
+
+    let tx1 = event_tx.clone();
+    let rx1 = shutdown_rx.clone();
+    let tx2 = event_tx.clone();
+    let rx2 = shutdown_rx.clone();
+    let tx3 = event_tx.clone();
+    let rx3 = shutdown_rx.clone();
+
+    tokio::spawn(async move {
+        client_spot.run_spot_stream(tx1, rx1).await;
+    });
+    tokio::spawn(async move {
+        client_depth.run_futures_depth_stream(tx2, rx2).await;
+    });
+    tokio::spawn(async move {
+        client_mark.run_futures_mark_stream(tx3, rx3).await;
+    });
+
+    let mut manager = MarketStateManager::new(Duration::from_millis(1500));
+    manager.register_instrument(VenueId::Binance, MarketType::Spot, symbol);
+    manager.register_instrument(VenueId::Binance, MarketType::LinearPerpetual, symbol);
+
+    let start = Instant::now();
+    let target_duration = Duration::from_secs(duration_secs);
+    let mut total_events_processed: u64 = 0;
+    let mut sequence_errors: u64 = 0;
+    let mut crossed_books_observed: u64 = 0;
+    let mut futures_snapshot_requested = false;
+    let mut futures_snapshot_applied = false;
+
+    while start.elapsed() < target_duration {
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                total_events_processed += 1;
+
+                let is_futures_snap = matches!(
+                    &event,
+                    MarketEvent::OrderBookSnapshot {
+                        market_type: MarketType::LinearPerpetual,
+                        ..
+                    }
+                );
+
+                if let Err(e) = manager.handle_event(&event) {
+                    match &e {
+                        EngineError::SequenceGap { .. } => {
+                            sequence_errors += 1;
+                            warn!(target: "airbitrage::state_live", error = %e, "Sequence gap observed in live stream");
+                        }
+                        EngineError::CrossedBook { .. } => {
+                            crossed_books_observed += 1;
+                            warn!(target: "airbitrage::state_live", error = %e, "Crossed book observed in live stream");
+                        }
+                        _ => {
+                            warn!(target: "airbitrage::state_live", error = %e, "Error handling MarketEvent");
+                        }
+                    }
+                } else if is_futures_snap {
+                    futures_snapshot_applied = true;
+                    info!(
+                        target: "airbitrage::state_live",
+                        "Futures depth snapshot applied and aligned with buffered deltas successfully"
+                    );
+                }
+
+                // Once we have buffered at least 5 Futures deltas, trigger concurrent REST depth snapshot fetch
+                if !futures_snapshot_requested && !futures_snapshot_applied {
+                    let buffered_count = manager
+                        .get_state(VenueId::Binance, MarketType::LinearPerpetual, symbol)
+                        .map(|s| s.buffered_delta_count())
+                        .unwrap_or(0);
+
+                    if buffered_count >= 5 {
+                        futures_snapshot_requested = true;
+                        info!(
+                            target: "airbitrage::state_live",
+                            buffered_count,
+                            "Triggering concurrent Binance Futures REST depth snapshot fetch"
+                        );
+                        let sym_copy = symbol.to_string();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(move || {
+                                fetch_binance_futures_snapshot(&sym_copy)
+                            })
+                            .await;
+
+                                match res {
+                                    Ok(Ok(snapshot_event)) => {
+                                        info!(
+                                            target: "airbitrage::state_live",
+                                            "Futures REST depth snapshot fetched successfully; dispatching to event loop"
+                                        );
+                                        let _ = tx.send(snapshot_event).await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        warn!(target: "airbitrage::state_live", error = %e, "Failed to fetch Futures depth snapshot");
+                                    }
+                                    Err(e) => {
+                                        warn!(target: "airbitrage::state_live", error = %e, "Task join error fetching Futures depth snapshot");
+                                    }
+                                }
+                        });
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    let elapsed = start.elapsed();
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+
+    let spot_trusted = manager.get_trusted_book(VenueId::Binance, MarketType::Spot, symbol, now_ns);
+    let fut_trusted = manager.get_trusted_book(
+        VenueId::Binance,
+        MarketType::LinearPerpetual,
+        symbol,
+        now_ns,
+    );
+
+    let spot_state = manager.get_state(VenueId::Binance, MarketType::Spot, symbol);
+    let fut_state = manager.get_state(VenueId::Binance, MarketType::LinearPerpetual, symbol);
+    let funding = manager.get_funding(VenueId::Binance, symbol);
+
+    println!("\n================================================================================");
+    println!("             LOCAL MARKET-STATE ENGINE VERIFIED LIVE TEST");
+    println!("================================================================================");
+    println!("Target Symbol:                {}", symbol.to_uppercase());
+    println!("Test Window Duration:         {:.2?}", elapsed);
+    println!("Total MarketEvents Processed: {}", total_events_processed);
+    println!("Sequence Continuity Errors:   {}", sequence_errors);
+    println!("Crossed Books Observed:       {}", crossed_books_observed);
+
+    println!("\n--------------------------------------------------------------------------------");
+    println!("1. BINANCE SPOT STATE");
+    if let Some(s) = spot_state {
+        println!("   Lifecycle State:           {:?}", s.lifecycle_state);
+        println!("   Validity:                  {:?}", s.validity);
+        println!("   Last Sequence ID:          {:?}", s.last_update_sequence);
+        println!(
+            "   Snapshots Applied:         {}",
+            s.metrics.snapshots_applied
+        );
+        println!(
+            "   Duplicate Snapshots:       {}",
+            s.metrics.duplicate_deltas
+        );
+        println!(
+            "   Is Stale (1.5s):           {}",
+            s.is_stale(Duration::from_millis(1500), now_ns)
+        );
+        println!("   Is Trusted:                {}", spot_trusted.is_some());
+        if let Some(b) = spot_trusted {
+            println!(
+                "   Best Bid:                  {}",
+                b.best_bid()
+                    .map(|l| l.price.to_string())
+                    .unwrap_or_else(|| "N/A".into())
+            );
+            println!(
+                "   Best Ask:                  {}",
+                b.best_ask()
+                    .map(|l| l.price.to_string())
+                    .unwrap_or_else(|| "N/A".into())
+            );
+            println!(
+                "   Spread:                    {}",
+                b.spread()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "N/A".into())
+            );
+        }
+    }
+
+    println!("\n--------------------------------------------------------------------------------");
+    println!("2. BINANCE USD-M FUTURES STATE");
+    if let Some(s) = fut_state {
+        println!("   Lifecycle State:           {:?}", s.lifecycle_state);
+        println!("   Validity:                  {:?}", s.validity);
+        println!("   Last Sequence ID:          {:?}", s.last_update_sequence);
+        println!(
+            "   Deltas Received:           {}",
+            s.metrics.deltas_received
+        );
+        println!("   Deltas Applied:            {}", s.metrics.deltas_applied);
+        println!(
+            "   Duplicate Deltas:          {}",
+            s.metrics.duplicate_deltas
+        );
+        println!("   Old Deltas:                {}", s.metrics.old_deltas);
+        println!(
+            "   Sequence Failures:         {}",
+            s.metrics.sequence_failures
+        );
+        println!("   Invalidations:             {}", s.metrics.invalidations);
+        println!(
+            "   Is Stale (1.5s):           {}",
+            s.is_stale(Duration::from_millis(1500), now_ns)
+        );
+        println!("   Is Trusted:                {}", fut_trusted.is_some());
+        if let Some(b) = fut_trusted {
+            println!(
+                "   Best Bid:                  {}",
+                b.best_bid()
+                    .map(|l| l.price.to_string())
+                    .unwrap_or_else(|| "N/A".into())
+            );
+            println!(
+                "   Best Ask:                  {}",
+                b.best_ask()
+                    .map(|l| l.price.to_string())
+                    .unwrap_or_else(|| "N/A".into())
+            );
+            println!(
+                "   Spread:                    {}",
+                b.spread()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "N/A".into())
+            );
+        }
+    }
+
+    println!("\n--------------------------------------------------------------------------------");
+    println!("3. LATEST FUNDING STATE");
+    if let Some(f) = funding {
+        println!("   Mark Price:                {}", f.mark_price);
+        println!(
+            "   Index Price:               {}",
+            f.index_price
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "N/A".into())
+        );
+        println!("   Funding Rate:              {}", f.rate);
+        println!("   Next Funding Settlement:   {} ms", f.next_funding_ts_ms);
+    }
+    println!("================================================================================\n");
+
+    if spot_trusted.is_none() {
+        return Err(EngineError::Validation(
+            "Live validation failed: Spot book is not trusted".into(),
+        ));
+    }
+    if fut_trusted.is_none() {
+        return Err(EngineError::Validation(
+            "Live validation failed: Futures book is not trusted".into(),
+        ));
+    }
+    if sequence_errors > 0 {
+        return Err(EngineError::Validation(format!(
+            "Live validation failed: {sequence_errors} sequence errors observed"
+        )));
+    }
+
+    info!(target: "airbitrage::state_live", "MarketStateManager live validation passed successfully");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let config_path = parse_config_path();
 
     init_logging("info");
+
+    if args.iter().any(|arg| arg == "--market-state-live") {
+        let pos = args.iter().position(|arg| arg == "--market-state-live");
+        let duration: u64 = pos
+            .and_then(|p| args.get(p + 1))
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(15);
+        return run_market_state_live_test("BTCUSDT", duration).await;
+    }
 
     if args.iter().any(|arg| arg == "--binance-smoke") {
         return run_binance_smoke_test("BTCUSDT").await;

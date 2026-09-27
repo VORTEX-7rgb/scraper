@@ -9,9 +9,14 @@ Airbitrage does not assume arbitrage is profitable or risk-free. It treats every
 
 ---
 
-## Current Status: Milestone M1.1 (Binance Protocol + Market-State Hardening Complete)
-* **Active Status:** M0 COMPLETE | M1 COMPLETE WITH M1.1 HARDENING | M2 NOT STARTED
+## Current Status: Milestone M2 (Local Market-State Engine Complete)
+* **Active Status:** M0 COMPLETE | M1 COMPLETE WITH M1.1 HARDENING | M2 COMPLETE | M3 NOT STARTED
 * **Toolchain:** Rust (Edition 2024, `rustc 1.98.1+`)
+* **Verified Market-State Engine:**
+  * **Binance Spot:** Continuous snapshot ingestion (`@depth20@100ms`), invariant checking, and microsecond freshness tracking.
+  * **Binance USD-M Futures:** REST depth snapshot synchronization, buffered delta drainage, $U \le S \le u$ initial alignment, continuous $pu == \text{previous } u$ sequence validation, and duplicate/old update filtering.
+  * **Order Book Lifecycle:** Explicit 6-state machine (`Empty`, `AwaitingSnapshot`, `Synchronizing`, `Live`, `Invalidated`, `Resyncing`).
+  * **Trust Gate:** Downstream code receives `trusted_book` only when state is strictly `Live`, `Valid`, uncrossed, and non-stale.
 * **Verified Venue Streams:**
   * **Binance Spot:** `wss://stream.binance.com/ws` (`<symbol>@depth20@100ms`) → Emits canonical `MarketEvent::OrderBookSnapshot`
   * **Binance USD-M Futures Depth:** `wss://fstream.binance.com/public/ws` (`<symbol>@depth20@100ms`) → Emits canonical `MarketEvent::OrderBookDelta` preserving `U`, `u`, `pu`, `E`, and `T`
@@ -50,7 +55,7 @@ Airbitrage does not assume arbitrage is profitable or risk-free. It treats every
 cargo build
 ```
 
-### Run Tests (24 Passing)
+### Run Tests (44 Passing)
 ```powershell
 cargo test
 ```
@@ -61,7 +66,12 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-### Run Live Binance Smoke Test (Verifies Spot + Futures Depth + Mark Price)
+### Run Live Market-State Engine Validation (Spot + Futures Synchronized Books)
+```powershell
+cargo run -- --market-state-live 20
+```
+
+### Run Live Binance Smoke Test (Verifies Raw Ingestion Feeds)
 ```powershell
 cargo run -- --binance-smoke
 ```

@@ -45,6 +45,17 @@ This register documents every core assumption, design decision, hypothesis, and 
     * Processing latency: p50: 8 µs, p95: 39 µs, p99: 46 µs, average: 17 µs.
     * Memory working set: 7.27 MB initial, 14.93 MB ending, 15.12 MB peak working set.
   * *Source:* Live 60-second continuous soak test execution (`--binance-soak 60`).
+* **FACT-10: Binance USD-M Futures Snapshot + Buffered Delta Alignment Semantics.**
+  * Official Binance protocol requires buffering depth updates while obtaining a REST depth snapshot (`GET /fapi/v1/depth?symbol=BTCUSDT&limit=50`).
+  * If snapshot `lastUpdateId` is $S$:
+    * Obsolete deltas where $u < S$ must be discarded.
+    * The first valid delta is the event where $U \le S \le u$ (or $pu = S \lor U = S + 1$). In this first covering event, $pu < S$.
+    * Subsequent buffered and live updates strictly require $pu == \text{previous } u$ and $U \le u$.
+  * *Source:* Official Binance USD-M Futures Public Market Data Documentation (Verified September 2026).
+* **FACT-11: Windows Schannel Offline CRL Check Behavior.**
+  * On Windows systems using Microsoft Schannel for TLS, HTTPS requests via `curl.exe` or WinHTTP may block for up to 15 seconds attempting to contact Certificate Revocation Lists if offline.
+  * Adding `--ssl-no-revoke` bypasses the offline CRL timeout and allows instantaneous TLS negotiation (< 200ms) without compromising security on public read-only market data endpoints.
+  * *Source:* Empirical testing during M2 live snapshot validation.
 
 ---
 
@@ -58,6 +69,8 @@ This register documents every core assumption, design decision, hypothesis, and 
 * **DEC-06: Message-Driven Enum Venue Abstraction.** Venue adapters emit standardized `MarketEvent` enum variants over channels rather than dynamic trait objects (`Box<dyn VenueAdapter>`), avoiding heap allocation and runtime vtable indirection.
 * **DEC-07: Monotonic Clock for Latency Tracking.** Monotonic `std::time::Instant` is used exclusively for internal latency delta calculations ($\Delta t = t_1 - t_0$). Wall-clock timestamps (Unix epoch nanoseconds) are recorded separately for logging and correlation.
 * **DEC-08: Cadence-Aware Stream Freshness.** Stream staleness thresholds are calibrated to nominal publication intervals: 500ms for 100ms depth streams, 3,000ms for 1,000ms mark price streams.
+* **DEC-09: Explicit Order Book Lifecycle State Machine.** Local market states enforce an explicit 6-state lifecycle (`Empty`, `AwaitingSnapshot`, `Synchronizing`, `Live`, `Invalidated`, `Resyncing`). An invalidated book is never exposed as trusted or executable.
+* **DEC-10: Invariant-Enforced Order Book Mutation.** Every delta application checks for crossed-book states (`best_bid >= best_ask`) and empty books. If violated, the state is immediately invalidated with structured diagnostic metadata rather than silently ignored.
 
 ---
 

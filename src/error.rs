@@ -31,6 +31,35 @@ pub enum EngineError {
     #[error("Data quality error: {0}")]
     DataQuality(String),
 
+    #[error(
+        "Sequence gap detected: expected previous {expected_prev}, received previous {received_prev:?}, first update {first_seq}, final update {final_seq}"
+    )]
+    SequenceGap {
+        expected_prev: u64,
+        received_prev: Option<u64>,
+        first_seq: u64,
+        final_seq: u64,
+    },
+
+    #[error("Out of order update: last accepted sequence {last_seq}, received {received_seq}")]
+    OutOfOrderUpdate { last_seq: u64, received_seq: u64 },
+
+    #[error("Invalid market state transition from {from} to {to}: {reason}")]
+    InvalidStateTransition {
+        from: String,
+        to: String,
+        reason: String,
+    },
+
+    #[error("Invalid book state: {0}")]
+    InvalidBookState(String),
+
+    #[error("Snapshot synchronization failure: {0}")]
+    SnapshotSyncFailure(String),
+
+    #[error("Stale market state: age {age_ms}ms exceeds maximum {max_age_ms}ms")]
+    StaleMarketState { age_ms: u64, max_age_ms: u64 },
+
     #[error("Transport/Network error: {0}")]
     Transport(String),
 
