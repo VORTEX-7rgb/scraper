@@ -390,4 +390,9 @@ impl MarketStateManager {
     pub fn set_max_staleness(&mut self, duration: Duration) {
         self.max_staleness = duration;
     }
+
+    /// Return an iterator over all managed instrument keys and their market states.
+    pub fn iter_states(&self) -> impl Iterator<Item = (&InstrumentKey, &MarketState)> {
+        self.books.iter()
+    }
 }

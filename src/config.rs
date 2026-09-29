@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub observatory: ObservatorySettings,
     #[serde(default)]
     pub recording: RecordingSettings,
+    #[serde(default)]
+    pub replay: ReplaySettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +121,31 @@ impl Default for RecordingSettings {
             enabled: default_recording_enabled(),
             output_dir: default_recording_dir(),
             auto_flush: default_auto_flush(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplaySettings {
+    #[serde(default = "default_fail_on_market_error")]
+    pub fail_on_market_error: bool,
+    #[serde(default = "default_stop_on_first_mismatch")]
+    pub stop_on_first_mismatch: bool,
+}
+
+fn default_fail_on_market_error() -> bool {
+    true
+}
+
+fn default_stop_on_first_mismatch() -> bool {
+    false
+}
+
+impl Default for ReplaySettings {
+    fn default() -> Self {
+        Self {
+            fail_on_market_error: default_fail_on_market_error(),
+            stop_on_first_mismatch: default_stop_on_first_mismatch(),
         }
     }
 }

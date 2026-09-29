@@ -77,6 +77,9 @@ pub enum EngineError {
 
     #[error("Recording error: {0}")]
     Recording(String),
+
+    #[error("Replay error: {0}")]
+    Replay(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;

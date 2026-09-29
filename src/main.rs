@@ -2209,12 +2209,45 @@ async fn run_four_book_recovery_test(symbol: &str) -> Result<()> {
     Ok(())
 }
 
+async fn run_replay_file(path: &str) -> Result<()> {
+    info!(target: "airbitrage::replay", path, "Starting historical replay execution");
+    let mut reader = airbitrage::recording::ResearchReader::from_path(path)?;
+    let mut engine = airbitrage::replay::ReplayEngine::with_defaults();
+    let result = engine.replay(&mut reader)?;
+    println!("{result}");
+    if !result.is_clean() {
+        warn!(
+            target: "airbitrage::replay",
+            mismatches = result.mismatches.len(),
+            "Replay completed with discrepancies"
+        );
+        return Err(EngineError::Replay(format!(
+            "Replay completed with {} mismatches",
+            result.mismatches.len()
+        )));
+    }
+    info!(target: "airbitrage::replay", "Replay completed cleanly with 0 mismatches");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let config_path = parse_config_path();
 
     init_logging("info");
+
+    if let Some(pos) = args
+        .iter()
+        .position(|arg| arg == "--replay" || arg == "replay")
+    {
+        if let Some(path) = args.get(pos + 1) {
+            return run_replay_file(path).await;
+        } else {
+            eprintln!("Usage: airbitrage --replay <path_to_research_ndjson>");
+            std::process::exit(1);
+        }
+    }
 
     if args.iter().any(|arg| arg == "--four-book-smoke") {
         return run_four_book_validation("BTCUSDT", 60).await;

@@ -9,10 +9,10 @@ Airbitrage does not assume arbitrage is profitable or risk-free. It treats every
 
 ---
 
-## Current Status: Milestone M5.4 (Research Recording Complete)
-* **Active Status:** M0 COMPLETE | M1 COMPLETE | M2 COMPLETE | M3 COMPLETE | M4 COMPLETE | M5.1–M5.4 COMPLETE | M5.5 NEXT
+## Current Status: Milestone M5.5 (Deterministic Replay Engine Complete)
+* **Active Status:** M0 COMPLETE | M1 COMPLETE | M2 COMPLETE | M3 COMPLETE | M4 COMPLETE | M5.1–M5.5 COMPLETE | M5.6 NEXT
 * **Toolchain:** Rust (Edition 2024, `rustc 1.85+` / `1.98.1+`)
-* **Verified Test Suite:** **135 deterministic tests passing** (`cargo test`)
+* **Verified Test Suite:** **167 deterministic tests passing** (`cargo test`)
 * **Market-Data Pipeline:**
   * **Binance Spot:** Continuous snapshot ingestion (`@depth20@100ms`), invariant checking, and microsecond freshness tracking.
   * **Binance USD-M Futures:** REST depth snapshot synchronization, buffered delta drainage, $U \le S \le u$ initial alignment, continuous $pu == \text{previous } u$ sequence validation, and funding rate stream tracking.
@@ -33,6 +33,11 @@ Airbitrage does not assume arbitrage is profitable or risk-free. It treats every
   * Newline-Delimited JSON (NDJSON) append-only recorder with explicit flush behavior.
   * Strict separation between raw observed data (`MarketEvent`), configured assumptions, and derived analytical observations (`DislocationObservation`, `OpportunityRecord`).
   * Loud failure on corrupted lines, truncated records, or unsupported schema versions.
+* **Deterministic Historical Replay Engine (M5.5):**
+  * Step-by-step market state reconstruction driven strictly by historical `MarketEvent`s.
+  * Pipeline re-evaluation through the active M4 pricing engine and M5 dislocation observatory.
+  * Exact Decimal field-by-field verification against recorded reference observations and persistence transitions.
+  * High-fidelity diagnostic mismatch reporting identifying discrepancy line numbers, field names, and values.
 * **Live Trading:** Strictly disabled. No API keys, no private endpoints, no order routing.
 
 ---
@@ -46,7 +51,8 @@ Airbitrage does not assume arbitrage is profitable or risk-free. It treats every
 4. Models all explicit frictions: exchange-specific taker fees, book slippage, and market impact.
 5. Measures dislocation persistence decay and tracks complete opportunity lifecycles.
 6. Serializes raw and derived events to deterministic, schema-versioned NDJSON datasets for auditable offline research.
-7. Simulates non-atomic execution via a realistic paper execution state machine (in subsequent replay milestones).
+7. Replays historical market datasets deterministically, verifying bit-for-bit consistency between observed market reconstruction and recorded analytical models.
+8. Simulates non-atomic execution via a realistic paper execution state machine (in subsequent milestones).
 
 ### What V1 Explicitly Does NOT Do
 * No live order placement, order modification, or cancellation.
@@ -67,7 +73,7 @@ Airbitrage does not assume arbitrage is profitable or risk-free. It treats every
 cargo build
 ```
 
-### Run Tests (135 Passing)
+### Run Tests (167 Passing)
 ```powershell
 cargo test
 ```
@@ -76,6 +82,12 @@ cargo test
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+```
+
+### Historical Replay Execution
+```powershell
+# Replay a recorded research dataset through MarketState -> M4 -> M5
+cargo run -- --replay data/research/BTCUSDT_2026-09-29.ndjson
 ```
 
 ### Live Validation Modes
@@ -102,6 +114,7 @@ cargo run -- --observatory-live 30
 * [M4 Executable Pricing Engine](docs/execution/m4_pricing_engine.md)
 * [M5 Dislocation Observatory](docs/observatory/m5_cross_book_dislocations.md)
 * [M5.4 Research Recording Specification](docs/recording/m5_4_research_recording.md)
+* [M5.5 Historical Replay Specification](docs/replay/m5_5_historical_replay.md)
 * [Binance Integration Specification](docs/venues/binance.md)
 * [Bybit Integration Specification](docs/venues/bybit.md)
 * [ADR 0001: V1 Research Scope](docs/adr/0001-v1-scope.md)
