@@ -10,13 +10,14 @@ This document defines the complete phased engineering roadmap for Airbitrage. Ea
   * **M1 STATUS: COMPLETE WITH M1.1 HARDENING** (Binance Protocol & Stream Hardening — Commit `12c42e8`)
   * **M2 STATUS: COMPLETE** (Local Market-State Engine — Deterministic Multi-Book Synchronization & Validation)
   * **M2.1 STATUS: COMPLETE** (Local Market-State Engine Hardening — Sequence Policies & Epochs)
-  * **M3 STATUS: NOT STARTED** (Bybit Public Market-Data Ingestion)
+  * **M3 STATUS: IN PROGRESS** (Bybit Public Market-Data Ingestion — M3.0 Protocol Audit & M3.1 WebSocket Transport Foundation COMPLETE)
 * **Rust Toolchain:** `rustc 1.98.1 (48a229cea 2026-09-01)` / Edition `2024`
 * **Cargo Check:** PASSED (0 errors, 0 warnings)
-* **Cargo Test:** PASSED (55 passed; 0 failed across foundation, binance feed, and market state suites)
+* **Cargo Test:** PASSED (70 passed; 0 failed across foundation, binance feed, market state, and bybit feed suites)
 * **Cargo Clippy:** PASSED (`--all-targets --all-features -- -D warnings`, 0 warnings)
 * **Cargo Fmt:** PASSED (`cargo fmt --check`, 0 diffs)
-* **Live Smoke Test:** PASSED (Binance Spot, Futures Depth `/public`, and Futures Mark Price `/market` streams verified live)
+* **Live Binance Smoke Test:** PASSED (Binance Spot, Futures Depth `/public`, and Futures Mark Price `/market` streams verified live)
+* **Live Bybit Smoke Test:** PASSED (Bybit Spot and Linear `orderbook.50.BTCUSDT` streams verified live: Spot 133 msgs [1 snapshot, 130 deltas], Linear 171 msgs [1 snapshot, 168 deltas], 0 sequence errors, 0 crossed books, 0 disconnects)
 * **Live Market-State Engine Test:** PASSED (Spot depth snapshots applied continuously, Futures REST snapshot fetched and aligned with buffered deltas, $U \le S \le u$ initial covering alignment verified, continuous $pu == \text{previous } u$ stream continuity enforced without sequence errors, crossed books rejected, trusted books verified)
 * **Extended Soak Test:** PASSED (60.00s continuous run: 1,126 stream messages received, 1,126 processed, 0 parse errors, 0 validation errors, 0 backpressure drops, 0 crossed books, p50: 8 µs, p99: 46 µs, peak working set: 15.12 MB)
 
@@ -123,17 +124,24 @@ This document defines the complete phased engineering roadmap for Airbitrage. Ea
 
 ---
 
-## Phase 3 — Bybit Market Data (M3) — *NOT STARTED*
+## Phase 3 — Bybit Market Data (M3) — *IN PROGRESS*
 * **Goal:** Implement an unauthenticated public WebSocket client for Bybit V5 Spot and Linear Futures, handling connection management, 20s ping/pong heartbeats, and subscribing to `orderbook.50` and `tickers` topics.
+* **Sub-Phases:**
+  * **M3.0: Protocol & Architecture Audit (COMPLETE):** First-party verification of Bybit V5 endpoints (`wss://stream.bybit.com/v5/public/spot`, `/linear`), topic format (`orderbook.50.<symbol>`), snapshot/delta envelope schemas, sequence semantics ($u$ monotonic strict increasing, no $pu$ chaining), heartbeat rules (client ping every 20s, server pong ack), and zero-quantity level deletion. Documented in `docs/venues/bybit.md`.
+  * **M3.1: Public WebSocket Transport Foundation (COMPLETE):** Implementation of `BybitFeedConfig`, `BybitWebSocketFeed`, heartbeat loop with zero task leaks, envelope parser (`parse_bybit_message`), canonical event emitter (`into_canonical_event`), `BybitMetrics`, 15 comprehensive unit tests, and live smoke test (`--bybit-smoke`).
+  * **M3.2: Spot OrderBook State Hardening (NOT STARTED):** Dedicated Spot book management, full snapshot recovery, and depth validation.
+  * **M3.3: Linear Perpetual OrderBook State Hardening (NOT STARTED):** Linear book management, depth validation, and contract multiplier awareness.
+  * **M3.4: Tickers & Funding Rate Ingestion (NOT STARTED):** `tickers.<symbol>` subscription for 8-hour funding rates, mark price, and index price.
+  * **M3.5: Reconnect, Resync & Recovery Lifecycles (NOT STARTED):** End-to-end failover, connection drop recovery, and state invalidation/re-snapshotting.
+  * **M3.6: Simultaneous 4-Book Live Validation & Soak (NOT STARTED):** Binance Spot + Binance Futures + Bybit Spot + Bybit Linear concurrent 60s soak testing.
 * **Inputs:** Public Bybit WebSocket streams (`wss://stream.bybit.com/v5/public/spot`, `/linear`).
 * **Outputs:** Normalized stream of `MarketEvent::OrderBookSnapshot`, `MarketEvent::OrderBookDelta`, and `MarketEvent::FundingRateUpdate`.
-* **Files/Modules:** `src/venues/bybit.rs`, `tests/bybit_feed_tests.rs`.
-* **Dependencies:** Reuses network stack from M1.
-* **Tests:** Snapshot initialisation verification, delta application parsing, heartbeat ping/pong timer verification.
-* **Benchmarks:** Frame normalization throughput benchmark.
-* **Acceptance Criteria:** Sustained live stream of BTCUSDT Spot and Linear with zero unhandled frame drops.
-* **Failure Criteria:** Heartbeat timeout disconnects, sequence gaps unflagged.
-* **Explicitly NOT Included:** Cross-venue comparison, order execution, private endpoints.
+* **Files/Modules:** `src/venues/bybit.rs`, `tests/bybit_feed_tests.rs`, `docs/venues/bybit.md`, `src/main.rs`.
+* **Dependencies:** Reuses network stack from M1 (`tokio`, `tokio-tungstenite`, `rust_decimal`, `serde_json`).
+* **Tests:** 15 deterministic unit tests in `tests/bybit_feed_tests.rs` verifying configs, requests, acks, snapshots, deltas, decimal parsing, deletions, unknown/malformed handling, heartbeats, $u$ extraction, and `MarketStateManager` integration with `SequencePolicy::MonotonicStrict`.
+* **Live Validation:** `cargo run -- --bybit-smoke` verifies real-time Bybit Spot and Linear streams.
+* **Failure Criteria:** Heartbeat timeout disconnects, sequence gaps unflagged, crossed books permitted.
+* **Explicitly NOT Included:** Cross-venue comparison, VWAP calculation, fee deductions, arbitrage detection, execution, private endpoints.
 
 ## Phase 4 — Executable VWAP (M4)
 * **Goal:** Implement a deterministic depth-walking VWAP algorithm to calculate the true executable buy cost and sell proceeds for discrete notional sizing tiers ($100, $500, $1,000).

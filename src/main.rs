@@ -3,6 +3,7 @@ use airbitrage::error::{EngineError, Result};
 use airbitrage::market::{MarketStateManager, OrderBook};
 use airbitrage::types::{MarketEvent, MarketType, PriceLevel, VenueId};
 use airbitrage::venues::binance::{BinanceClient, BinanceStreamType};
+use airbitrage::venues::bybit::{BybitFeedConfig, BybitMetrics, BybitWebSocketFeed};
 use rust_decimal::Decimal;
 use std::env;
 use std::path::PathBuf;
@@ -285,6 +286,220 @@ async fn run_binance_smoke_test(symbol: &str) -> Result<()> {
     }
 
     info!(target: "airbitrage::smoke", "Live Binance M1.1 smoke test completed successfully with all 3 streams verified");
+    Ok(())
+}
+
+async fn run_bybit_smoke_test(symbol: &str) -> Result<()> {
+    info!(target: "airbitrage::smoke", symbol, "Starting live Bybit M3.1 smoke test (Spot + Linear)");
+
+    let mut manager = MarketStateManager::new(Duration::from_millis(10_000));
+
+    println!("\n================================================================================");
+    println!("             BYBIT PROTOCOL M3.1 VERIFIED LIVE SMOKE TEST");
+    println!("================================================================================");
+    println!("Target Symbol:                {}", symbol.to_uppercase());
+
+    // 1. BYBIT SPOT
+    info!(target: "airbitrage::smoke", "Connecting to Bybit Spot WebSocket feed...");
+    let metrics_spot = std::sync::Arc::new(BybitMetrics::default());
+    let config_spot = BybitFeedConfig::default_spot(symbol);
+    let (event_tx_spot, mut event_rx_spot) = mpsc::channel::<MarketEvent>(1024);
+    let (shutdown_tx_spot, shutdown_rx_spot) = tokio::sync::watch::channel(false);
+    let feed_spot =
+        BybitWebSocketFeed::with_metrics(config_spot, metrics_spot.clone(), event_tx_spot);
+
+    tokio::spawn(async move {
+        let _ = feed_spot.run_stream(shutdown_rx_spot).await;
+    });
+
+    let mut spot_seq_violations = 0;
+    let mut spot_crossed_books = 0;
+    let spot_timeout = Duration::from_secs(6);
+    let spot_start = Instant::now();
+
+    while spot_start.elapsed() < spot_timeout {
+        tokio::select! {
+            Some(event) = event_rx_spot.recv() => {
+                if let Err(e) = manager.handle_event(&event) {
+                    spot_seq_violations += 1;
+                    warn!(target: "airbitrage::smoke", error = %e, "Bybit Spot state event error");
+                }
+                if let Some(state) = manager.get_state(VenueId::Bybit, MarketType::Spot, symbol) {
+                    let crossed = match (state.book.best_bid(), state.book.best_ask()) {
+                        (Some(bid), Some(ask)) => bid.price >= ask.price,
+                        _ => false,
+                    };
+                    if crossed {
+                        spot_crossed_books += 1;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    let _ = shutdown_tx_spot.send(true);
+    let spot_metrics_snap = metrics_spot.snapshot();
+    let spot_state = manager.get_state(VenueId::Bybit, MarketType::Spot, symbol);
+
+    println!("\n--------------------------------------------------------------------------------");
+    println!("1. BYBIT SPOT STREAM");
+    println!(
+        "   Messages Received:         {}",
+        spot_metrics_snap.messages_received
+    );
+    println!(
+        "   Snapshots:                 {}",
+        spot_metrics_snap.snapshots_received
+    );
+    println!(
+        "   Deltas:                    {}",
+        spot_metrics_snap.deltas_received
+    );
+    println!(
+        "   Parse Errors:              {}",
+        spot_metrics_snap.parse_errors
+    );
+    println!(
+        "   Unknown Messages:          {}",
+        spot_metrics_snap.unknown_messages
+    );
+    println!("   Sequence Violations:       {}", spot_seq_violations);
+    println!("   Crossed Books:             {}", spot_crossed_books);
+    println!(
+        "   Connection Drops:          {}",
+        spot_metrics_snap.disconnects
+    );
+    println!(
+        "   Reconnects:                {}",
+        spot_metrics_snap.reconnects
+    );
+    if let Some(s) = spot_state {
+        println!("   Current Lifecycle:         {:?}", s.lifecycle_state);
+        println!(
+            "   Current Best Bid:          {:?}",
+            s.book
+                .best_bid()
+                .map(|l| (l.price.to_string(), l.quantity.to_string()))
+        );
+        println!(
+            "   Current Best Ask:          {:?}",
+            s.book
+                .best_ask()
+                .map(|l| (l.price.to_string(), l.quantity.to_string()))
+        );
+    } else {
+        println!("   Current Lifecycle:         Uninitialized");
+        println!("   Current Best Bid:          None");
+        println!("   Current Best Ask:          None");
+    }
+
+    // 2. BYBIT LINEAR
+    info!(target: "airbitrage::smoke", "Connecting to Bybit Linear WebSocket feed...");
+    let metrics_linear = std::sync::Arc::new(BybitMetrics::default());
+    let config_linear = BybitFeedConfig::default_linear(symbol);
+    let (event_tx_linear, mut event_rx_linear) = mpsc::channel::<MarketEvent>(1024);
+    let (shutdown_tx_linear, shutdown_rx_linear) = tokio::sync::watch::channel(false);
+    let feed_linear =
+        BybitWebSocketFeed::with_metrics(config_linear, metrics_linear.clone(), event_tx_linear);
+
+    tokio::spawn(async move {
+        let _ = feed_linear.run_stream(shutdown_rx_linear).await;
+    });
+
+    let mut linear_seq_violations = 0;
+    let mut linear_crossed_books = 0;
+    let linear_timeout = Duration::from_secs(6);
+    let linear_start = Instant::now();
+
+    while linear_start.elapsed() < linear_timeout {
+        tokio::select! {
+            Some(event) = event_rx_linear.recv() => {
+                if let Err(e) = manager.handle_event(&event) {
+                    linear_seq_violations += 1;
+                    warn!(target: "airbitrage::smoke", error = %e, "Bybit Linear state event error");
+                }
+                if let Some(state) = manager.get_state(VenueId::Bybit, MarketType::LinearPerpetual, symbol) {
+                    let crossed = match (state.book.best_bid(), state.book.best_ask()) {
+                        (Some(bid), Some(ask)) => bid.price >= ask.price,
+                        _ => false,
+                    };
+                    if crossed {
+                        linear_crossed_books += 1;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    let _ = shutdown_tx_linear.send(true);
+    let linear_metrics_snap = metrics_linear.snapshot();
+    let linear_state = manager.get_state(VenueId::Bybit, MarketType::LinearPerpetual, symbol);
+
+    println!("\n--------------------------------------------------------------------------------");
+    println!("2. BYBIT LINEAR STREAM");
+    println!(
+        "   Messages Received:         {}",
+        linear_metrics_snap.messages_received
+    );
+    println!(
+        "   Snapshots:                 {}",
+        linear_metrics_snap.snapshots_received
+    );
+    println!(
+        "   Deltas:                    {}",
+        linear_metrics_snap.deltas_received
+    );
+    println!(
+        "   Parse Errors:              {}",
+        linear_metrics_snap.parse_errors
+    );
+    println!(
+        "   Unknown Messages:          {}",
+        linear_metrics_snap.unknown_messages
+    );
+    println!("   Sequence Violations:       {}", linear_seq_violations);
+    println!("   Crossed Books:             {}", linear_crossed_books);
+    println!(
+        "   Connection Drops:          {}",
+        linear_metrics_snap.disconnects
+    );
+    println!(
+        "   Reconnects:                {}",
+        linear_metrics_snap.reconnects
+    );
+    if let Some(s) = linear_state {
+        println!("   Current Lifecycle:         {:?}", s.lifecycle_state);
+        println!(
+            "   Current Best Bid:          {:?}",
+            s.book
+                .best_bid()
+                .map(|l| (l.price.to_string(), l.quantity.to_string()))
+        );
+        println!(
+            "   Current Best Ask:          {:?}",
+            s.book
+                .best_ask()
+                .map(|l| (l.price.to_string(), l.quantity.to_string()))
+        );
+    } else {
+        println!("   Current Lifecycle:         Uninitialized");
+        println!("   Current Best Bid:          None");
+        println!("   Current Best Ask:          None");
+    }
+
+    println!("\n================================================================================");
+    if spot_metrics_snap.messages_received == 0 {
+        return Err(EngineError::Transport(
+            "Bybit smoke test failed: Spot stream received 0 messages".into(),
+        ));
+    }
+    if linear_metrics_snap.messages_received == 0 {
+        return Err(EngineError::Transport(
+            "Bybit smoke test failed: Linear stream received 0 messages".into(),
+        ));
+    }
+
+    info!(target: "airbitrage::smoke", "Live Bybit M3.1 smoke test completed successfully with both Spot and Linear verified");
     Ok(())
 }
 
@@ -855,6 +1070,10 @@ async fn main() -> Result<()> {
 
     if args.iter().any(|arg| arg == "--binance-smoke") {
         return run_binance_smoke_test("BTCUSDT").await;
+    }
+
+    if args.iter().any(|arg| arg == "--bybit-smoke") {
+        return run_bybit_smoke_test("BTCUSDT").await;
     }
 
     if let Some(pos) = args.iter().position(|arg| arg == "--binance-soak") {
