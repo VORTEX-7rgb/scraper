@@ -1,7 +1,7 @@
 use airbitrage::error::EngineError;
 use airbitrage::market::MarketStateManager;
 use airbitrage::market::state::{
-    BookLifecycleState, BookValidity, DeltaUpdate, InvalidationReason, MarketState,
+    BookLifecycleState, BookValidity, DeltaUpdate, InvalidationReason, MarketState, SequencePolicy,
 };
 use airbitrage::types::{MarketEvent, MarketType, PriceLevel, VenueId};
 use rust_decimal_macros::dec;
@@ -705,4 +705,505 @@ fn test_manager_funding_rate_routing() {
     assert_eq!(fund_state.mark_price, dec!(65010.50));
     assert_eq!(fund_state.rate, dec!(0.00010000));
     assert_eq!(fund_state.next_funding_ts_ms, 1727414400000);
+}
+
+// ============================================================================
+// 21. M2.1 TEST 1: BINANCE FUTURES INITIAL COVERING UPDATE
+// ============================================================================
+
+#[test]
+fn test_m2_1_binance_futures_initial_covering_during_synchronization() {
+    let mut state = MarketState::new(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT");
+    assert_eq!(state.sequence_policy, SequencePolicy::ContiguousPrevious);
+
+    let bids = vec![PriceLevel::new(dec!(65000.00), dec!(1.0))];
+    let asks = vec![PriceLevel::new(dec!(65010.00), dec!(1.0))];
+    state.apply_snapshot(bids, asks, 1000, 1000, 100).unwrap();
+
+    // Snapshot ends at sequence 100. Delta covers 100: U=95 <= 100 <= u=105
+    let covering_delta = make_delta(
+        vec![PriceLevel::new(dec!(65002.00), dec!(0.5))],
+        vec![],
+        95,
+        105,
+        Some(94),
+        1010,
+    );
+    let applied = state
+        .apply_delta(covering_delta)
+        .expect("Initial covering update should succeed");
+    assert!(applied);
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Live);
+    assert!(state.validity.is_valid());
+    assert_eq!(state.last_update_sequence, Some(105));
+    assert!(state.trusted_book(None, 1010).is_some());
+}
+
+// ============================================================================
+// 22. M2.1 TEST 2: COVERING EXCEPTION IS ONE-TIME (REGRESSION TEST)
+// ============================================================================
+
+#[test]
+fn test_m2_1_covering_exception_is_one_time_regression() {
+    let mut state = MarketState::new(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT");
+
+    // Snapshot at sequence 100
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+
+    // First covering update: U=95, u=105, valid -> book becomes Live
+    let delta1 = make_delta(
+        vec![PriceLevel::new(dec!(65002.00), dec!(0.5))],
+        vec![],
+        95,
+        105,
+        Some(94),
+        1010,
+    );
+    state
+        .apply_delta(delta1)
+        .expect("First covering delta must succeed");
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Live);
+    assert_eq!(state.last_update_sequence, Some(105));
+
+    // Later update: U=100, u=110, pu does NOT equal previous u (105).
+    // Note that mathematically 100 <= 105 <= 110, so under the vulnerable code
+    // this would have been treated as an initial covering snapshot and accepted!
+    // But since the book is already Live and covering exception was consumed,
+    // it MUST be rejected with SequenceGap and MUST invalidate!
+    let later_invalid_delta = make_delta(
+        vec![PriceLevel::new(dec!(65003.00), dec!(0.8))],
+        vec![],
+        100,
+        110,
+        Some(99), // Invalid: previous u is 105, not 99
+        1020,
+    );
+    let result = state.apply_delta(later_invalid_delta);
+    assert!(result.is_err());
+    match result {
+        Err(EngineError::SequenceGap {
+            expected_prev,
+            received_prev,
+            ..
+        }) => {
+            assert_eq!(expected_prev, 105);
+            assert_eq!(received_prev, Some(99));
+        }
+        other => panic!("Expected SequenceGap, got: {:?}", other),
+    }
+
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Invalidated);
+    assert!(!state.validity.is_valid());
+    assert!(state.trusted_book(None, 1020).is_none());
+    assert_eq!(state.metrics.sequence_failures, 1);
+}
+
+// ============================================================================
+// 23. M2.1 TEST 3: BINANCE FUTURES STRICT PU CONTINUITY
+// ============================================================================
+
+#[test]
+fn test_m2_1_binance_futures_strict_pu_continuity() {
+    let mut state = MarketState::new(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT");
+
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+
+    // First update: u=105, pu=100 -> accepted
+    let delta1 = make_delta(vec![], vec![], 101, 105, Some(100), 1010);
+    assert!(state.apply_delta(delta1).unwrap());
+    assert_eq!(state.last_update_sequence, Some(105));
+
+    // Second update: previous u is 105. incoming pu is 105 -> accepted
+    let delta2 = make_delta(vec![], vec![], 106, 110, Some(105), 1020);
+    assert!(state.apply_delta(delta2).unwrap());
+    assert_eq!(state.last_update_sequence, Some(110));
+
+    // Third update: previous u is 110. incoming pu is 107 (mismatch) -> rejected!
+    let delta3 = make_delta(vec![], vec![], 108, 115, Some(107), 1030);
+    let result = state.apply_delta(delta3);
+    assert!(result.is_err());
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Invalidated);
+    assert!(state.trusted_book(None, 1030).is_none());
+}
+
+// ============================================================================
+// 24. M2.1 TEST 4: BINANCE FUTURES DOES NOT REQUIRE U == PREVIOUS + 1
+// ============================================================================
+
+#[test]
+fn test_m2_1_binance_futures_permits_range_jump_without_plus_one() {
+    let mut state = MarketState::new(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT");
+
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+
+    // previous u = 100. Incoming: pu = 100, u = 108 (jumps by 8, not 1)
+    let delta = make_delta(
+        vec![PriceLevel::new(dec!(65001.00), dec!(2.0))],
+        vec![],
+        101,
+        108,
+        Some(100),
+        1010,
+    );
+    let res = state.apply_delta(delta);
+    assert!(res.is_ok());
+    assert_eq!(state.last_update_sequence, Some(108));
+    assert!(state.trusted_book(None, 1010).is_some());
+}
+
+// ============================================================================
+// 25. M2.1 TEST 5: BYBIT MONOTONIC INCREASING SEQUENCE ACCEPTED
+// ============================================================================
+
+#[test]
+fn test_m2_1_bybit_monotonic_increasing_sequence_accepted() {
+    let mut state = MarketState::with_policy(
+        VenueId::Bybit,
+        MarketType::LinearPerpetual,
+        "BTCUSDT",
+        SequencePolicy::MonotonicStrict,
+    );
+    assert_eq!(state.sequence_policy, SequencePolicy::MonotonicStrict);
+
+    // Initial snapshot at 100
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+
+    // 100 -> 105
+    let delta1 = make_delta(
+        vec![PriceLevel::new(dec!(65002.00), dec!(1.0))],
+        vec![],
+        105,
+        105,
+        None,
+        1010,
+    );
+    assert!(state.apply_delta(delta1).unwrap());
+    assert_eq!(state.last_update_sequence, Some(105));
+
+    // 105 -> 120
+    let delta2 = make_delta(
+        vec![PriceLevel::new(dec!(65003.00), dec!(1.0))],
+        vec![],
+        120,
+        120,
+        None,
+        1020,
+    );
+    assert!(state.apply_delta(delta2).unwrap());
+    assert_eq!(state.last_update_sequence, Some(120));
+
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Live);
+    assert!(state.trusted_book(None, 1020).is_some());
+}
+
+// ============================================================================
+// 26. M2.1 TEST 6: BYBIT DUPLICATE REJECTED
+// ============================================================================
+
+#[test]
+fn test_m2_1_bybit_duplicate_sequence_rejected() {
+    let mut state = MarketState::with_policy(
+        VenueId::Bybit,
+        MarketType::LinearPerpetual,
+        "BTCUSDT",
+        SequencePolicy::MonotonicStrict,
+    );
+
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+
+    // 100 -> 100 duplicate MUST be rejected
+    let delta = make_delta(vec![], vec![], 100, 100, None, 1010);
+    let result = state.apply_delta(delta);
+    assert!(result.is_err());
+    match result {
+        Err(EngineError::OutOfOrderUpdate {
+            last_seq,
+            received_seq,
+        }) => {
+            assert_eq!(last_seq, 100);
+            assert_eq!(received_seq, 100);
+        }
+        other => panic!("Expected OutOfOrderUpdate, got: {:?}", other),
+    }
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Invalidated);
+    assert!(state.trusted_book(None, 1010).is_none());
+}
+
+// ============================================================================
+// 27. M2.1 TEST 7: BYBIT DECREASING SEQUENCE REJECTED
+// ============================================================================
+
+#[test]
+fn test_m2_1_bybit_decreasing_sequence_rejected() {
+    let mut state = MarketState::with_policy(
+        VenueId::Bybit,
+        MarketType::LinearPerpetual,
+        "BTCUSDT",
+        SequencePolicy::MonotonicStrict,
+    );
+
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+
+    // 100 -> 95 decreasing sequence MUST be rejected
+    let delta = make_delta(vec![], vec![], 95, 95, None, 1010);
+    let result = state.apply_delta(delta);
+    assert!(result.is_err());
+    match result {
+        Err(EngineError::OutOfOrderUpdate {
+            last_seq,
+            received_seq,
+        }) => {
+            assert_eq!(last_seq, 100);
+            assert_eq!(received_seq, 95);
+        }
+        other => panic!("Expected OutOfOrderUpdate, got: {:?}", other),
+    }
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Invalidated);
+    assert!(state.trusted_book(None, 1010).is_none());
+}
+
+// ============================================================================
+// 28. M2.1 TEST 8: RESNAPSHOT RESETS SEQUENCE EPOCH
+// ============================================================================
+
+#[test]
+fn test_m2_1_resnapshot_resets_sequence_epoch() {
+    let mut state = MarketState::with_policy(
+        VenueId::Bybit,
+        MarketType::LinearPerpetual,
+        "BTCUSDT",
+        SequencePolicy::MonotonicStrict,
+    );
+    assert_eq!(state.epoch(), 1);
+
+    // Initial snapshot at 100 -> delta at 105
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+    state
+        .apply_delta(make_delta(vec![], vec![], 105, 105, None, 1010))
+        .unwrap();
+    assert_eq!(state.last_update_sequence, Some(105));
+
+    // Sequence failure (out of order: 105 -> 102)
+    let err = state.apply_delta(make_delta(vec![], vec![], 102, 102, None, 1020));
+    assert!(err.is_err());
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Invalidated);
+
+    // Resynchronization cycle
+    state.request_resync().unwrap();
+    assert_eq!(state.epoch(), 2);
+    assert_eq!(state.lifecycle_state, BookLifecycleState::AwaitingSnapshot);
+    assert_eq!(state.last_update_sequence, None);
+
+    // Feed restart sends snapshot with u=1. Must be accepted despite 1 < 105!
+    let snap_res = state.apply_snapshot(
+        vec![PriceLevel::new(dec!(65005.00), dec!(1.0))],
+        vec![PriceLevel::new(dec!(65015.00), dec!(1.0))],
+        2000,
+        2000,
+        1,
+    );
+    assert!(snap_res.is_ok());
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Live);
+    assert_eq!(state.last_update_sequence, Some(1));
+    assert!(state.trusted_book(None, 2000).is_some());
+
+    // Subsequent monotonic delta u=2 applies cleanly in epoch 2
+    let d2 = make_delta(
+        vec![PriceLevel::new(dec!(65006.00), dec!(1.5))],
+        vec![],
+        2,
+        2,
+        None,
+        2010,
+    );
+    assert!(state.apply_delta(d2).unwrap());
+    assert_eq!(state.last_update_sequence, Some(2));
+}
+
+// ============================================================================
+// 29. M2.1 TEST 9: TRUSTED GATE AFTER SEQUENCE FAILURE (FAILS CLOSED)
+// ============================================================================
+
+#[test]
+fn test_m2_1_trusted_gate_after_sequence_failure() {
+    let mut state = MarketState::new(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT");
+
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+    assert!(state.trusted_book(None, 1000).is_some());
+
+    // Sequence violation: expected prev 100, received 105
+    let gap_delta = make_delta(vec![], vec![], 106, 110, Some(105), 1010);
+    let _ = state.apply_delta(gap_delta);
+
+    // Book MUST fail closed: trusted_book returns None
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Invalidated);
+    assert!(!state.validity.is_valid());
+    assert_eq!(state.trusted_book(None, 1010), None);
+}
+
+// ============================================================================
+// 30. M2.1 TEST 10: RECOVERY LIFECYCLE (AWAITING -> SYNCHRONIZING -> LIVE)
+// ============================================================================
+
+#[test]
+fn test_m2_1_recovery_awaiting_synchronizing_live() {
+    let mut state = MarketState::new(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT");
+
+    // Initialize & invalidate
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+    let _ = state.apply_delta(make_delta(vec![], vec![], 110, 115, Some(109), 1010));
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Invalidated);
+    assert!(state.trusted_book(None, 1010).is_none());
+
+    // Resync -> AwaitingSnapshot
+    state.request_resync().unwrap();
+    assert_eq!(state.lifecycle_state, BookLifecycleState::AwaitingSnapshot);
+
+    // Deltas buffered during AwaitingSnapshot
+    state
+        .apply_delta(make_delta(
+            vec![PriceLevel::new(dec!(65001.00), dec!(1.0))],
+            vec![],
+            201,
+            205,
+            Some(200),
+            2010,
+        ))
+        .unwrap();
+    assert_eq!(state.buffered_delta_count(), 1);
+
+    // Snapshot arrives at sequence 200 -> drains buffer through Synchronizing -> Live
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(2.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(2.0))],
+            2000,
+            2000,
+            200,
+        )
+        .unwrap();
+
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Live);
+    assert!(state.validity.is_valid());
+    assert_eq!(state.last_update_sequence, Some(205));
+    assert!(state.trusted_book(None, 2010).is_some());
+    assert_eq!(
+        state.best_bid(),
+        Some(PriceLevel::new(dec!(65001.00), dec!(1.0)))
+    );
+}
+
+// ============================================================================
+// 31. M2.1 TEST 11: CROSSED BOOK REMAINS INVALID
+// ============================================================================
+
+#[test]
+fn test_m2_1_crossed_book_remains_invalid() {
+    let mut state = MarketState::new(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT");
+
+    state
+        .apply_snapshot(
+            vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            1000,
+            1000,
+            100,
+        )
+        .unwrap();
+    assert!(state.trusted_book(None, 1000).is_some());
+
+    // Valid sequence delta that crosses the book (bid 65015 >= ask 65010)
+    let crossed_delta = make_delta(
+        vec![PriceLevel::new(dec!(65015.00), dec!(1.0))],
+        vec![],
+        101,
+        105,
+        Some(100),
+        1010,
+    );
+    let result = state.apply_delta(crossed_delta);
+    assert!(result.is_err());
+    match result {
+        Err(EngineError::CrossedBook { bid, ask }) => {
+            assert_eq!(bid, dec!(65015.00));
+            assert_eq!(ask, dec!(65010.00));
+        }
+        other => panic!("Expected CrossedBook, got: {:?}", other),
+    }
+
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Invalidated);
+    assert!(!state.validity.is_valid());
+    assert!(state.trusted_book(None, 1010).is_none());
 }

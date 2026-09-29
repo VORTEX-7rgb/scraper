@@ -1,6 +1,8 @@
 use crate::error::{EngineError, Result};
 use crate::market::OrderBook;
-use crate::market::state::{DeltaUpdate, InvalidationReason, MarketState, MarketStateMetrics};
+use crate::market::state::{
+    DeltaUpdate, InvalidationReason, MarketState, MarketStateMetrics, SequencePolicy,
+};
 use crate::types::{MarketEvent, MarketType, PriceLevel, VenueId};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -58,7 +60,8 @@ impl MarketStateManager {
         }
     }
 
-    /// Register an instrument to be managed. Initializes an empty state awaiting snapshot.
+    /// Register an instrument to be managed. Initializes an empty state awaiting snapshot
+    /// with default sequence policy for the venue and market type.
     pub fn register_instrument(
         &mut self,
         venue: VenueId,
@@ -69,6 +72,20 @@ impl MarketStateManager {
         self.books
             .entry(key.clone())
             .or_insert_with(|| MarketState::new(key.venue, key.market_type, key.symbol));
+    }
+
+    /// Register an instrument with an explicit sequence policy.
+    pub fn register_instrument_with_policy(
+        &mut self,
+        venue: VenueId,
+        market_type: MarketType,
+        symbol: impl Into<String>,
+        sequence_policy: SequencePolicy,
+    ) {
+        let key = InstrumentKey::new(venue, market_type, symbol);
+        self.books.entry(key.clone()).or_insert_with(|| {
+            MarketState::with_policy(key.venue, key.market_type, key.symbol, sequence_policy)
+        });
     }
 
     /// Ingest and route an incoming canonical `MarketEvent`.

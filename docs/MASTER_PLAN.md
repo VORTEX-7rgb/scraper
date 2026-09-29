@@ -9,10 +9,11 @@ This document defines the complete phased engineering roadmap for Airbitrage. Ea
   * **M0 STATUS: COMPLETE** (Foundation & Project Scaffolding — Commit `52ccb6f`)
   * **M1 STATUS: COMPLETE WITH M1.1 HARDENING** (Binance Protocol & Stream Hardening — Commit `12c42e8`)
   * **M2 STATUS: COMPLETE** (Local Market-State Engine — Deterministic Multi-Book Synchronization & Validation)
+  * **M2.1 STATUS: COMPLETE** (Local Market-State Engine Hardening — Sequence Policies & Epochs)
   * **M3 STATUS: NOT STARTED** (Bybit Public Market-Data Ingestion)
 * **Rust Toolchain:** `rustc 1.98.1 (48a229cea 2026-09-01)` / Edition `2024`
 * **Cargo Check:** PASSED (0 errors, 0 warnings)
-* **Cargo Test:** PASSED (44 passed; 0 failed across foundation, binance feed, and market state suites)
+* **Cargo Test:** PASSED (55 passed; 0 failed across foundation, binance feed, and market state suites)
 * **Cargo Clippy:** PASSED (`--all-targets --all-features -- -D warnings`, 0 warnings)
 * **Cargo Fmt:** PASSED (`cargo fmt --check`, 0 diffs)
 * **Live Smoke Test:** PASSED (Binance Spot, Futures Depth `/public`, and Futures Mark Price `/market` streams verified live)
@@ -98,6 +99,27 @@ This document defines the complete phased engineering roadmap for Airbitrage. Ea
   * Live 20-second test verifying real-time Spot snapshots and synchronized Futures deltas with 0 sequence errors and 0 crossed books.
   * Zero compiler warnings, 0 clippy warnings, clean formatting.
 * **Explicitly NOT Included:** Bybit connector (M3), executable VWAP (M4), cost modeling (M5), dislocation signals (M6), live trading.
+
+---
+
+## Phase 2.1 — Local Market-State Engine Hardening (M2.1) — *COMPLETE*
+* **Goal:** Harden the local market-state engine with explicit venue sequence policies, eliminate the covering update vulnerability in live state, support Bybit-compatible monotonic sequences without $+1$ restriction, implement synchronization epochs for clean restart snapshots ($u=1$), and enforce strict fail-closed trust gates.
+* **Inputs:** Sequence policy specifications, empirical Bybit V5 matching engine sequence characteristics, Binance USD-M Futures continuity requirements.
+* **Outputs:**
+  * `SequencePolicy` enum (`SnapshotOnly`, `ContiguousPrevious`, `MonotonicStrict`) with venue/market defaults.
+  * One-time covering update guard in `MarketState` (`awaiting_initial_covering`).
+  * Synchronization epoch counter (`epoch: u64`) ensuring restart snapshots re-anchor cleanly.
+  * 11 new deterministic tests (31 tests total in `market_state_tests.rs`).
+* **Files/Modules:**
+  * `src/market/state.rs` (`SequencePolicy`, `MarketState::with_policy`, hardened `apply_snapshot` and `apply_delta`, `epoch` tracking)
+  * `src/market/manager.rs` (`register_instrument_with_policy`)
+  * `src/market/mod.rs` (re-export `SequencePolicy`)
+  * `tests/market_state_tests.rs` (11 new deterministic regression & unit tests)
+  * `docs/ARCHITECTURE.md` (Section 5.4)
+* **Acceptance Criteria:**
+  * All 11 new tests passing, all 44 existing tests passing (55 total).
+  * `cargo check`, `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` all exit 0.
+* **Explicitly NOT Included:** Bybit network connector (M3), Bybit WebSockets, authentication, private APIs, trading.
 
 ---
 

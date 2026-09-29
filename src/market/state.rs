@@ -6,6 +6,28 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::time::Duration;
 
+/// Sequencing model enforced by an instrument's venue protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SequencePolicy {
+    /// Full snapshots only; each snapshot advances sequence ID (e.g. Binance Spot).
+    SnapshotOnly,
+    /// Incremental deltas requiring continuity via previous update ID `pu == last_u` (e.g. Binance USD-M Futures).
+    ContiguousPrevious,
+    /// Incremental deltas requiring strictly monotonically increasing update ID `u > last_u` (e.g. Bybit Spot & Linear).
+    MonotonicStrict,
+}
+
+impl SequencePolicy {
+    /// Return the canonical default sequence policy for a venue and market type.
+    pub fn default_for(venue: VenueId, market_type: MarketType) -> Self {
+        match (venue, market_type) {
+            (VenueId::Binance, MarketType::Spot) => Self::SnapshotOnly,
+            (VenueId::Binance, MarketType::LinearPerpetual) => Self::ContiguousPrevious,
+            (VenueId::Bybit, _) => Self::MonotonicStrict,
+        }
+    }
+}
+
 /// Explicit lifecycle states for a managed local limit order book.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BookLifecycleState {
@@ -37,14 +59,17 @@ impl BookLifecycleState {
             (Self::AwaitingSnapshot, Self::Synchronizing) => true,
             (Self::AwaitingSnapshot, Self::Live) => true, // Snapshot-only streams (e.g. Spot depth20)
             (Self::AwaitingSnapshot, Self::Invalidated) => true,
+            (Self::AwaitingSnapshot, Self::Resyncing) => true,
 
             // From Synchronizing
             (Self::Synchronizing, Self::Live) => true,
             (Self::Synchronizing, Self::Invalidated) => true,
+            (Self::Synchronizing, Self::Resyncing) => true,
 
             // From Live
             (Self::Live, Self::Invalidated) => true,
             (Self::Live, Self::Resyncing) => true,
+            (Self::Live, Self::Synchronizing) => true,
             (Self::Live, Self::Live) => true, // Ongoing stream updates
 
             // From Invalidated
@@ -195,6 +220,9 @@ pub struct MarketState {
     pub venue: VenueId,
     pub market_type: MarketType,
     pub symbol: String,
+    pub sequence_policy: SequencePolicy,
+    pub epoch: u64,
+    awaiting_initial_covering: bool,
 
     pub book: OrderBook,
     pub lifecycle_state: BookLifecycleState,
@@ -212,11 +240,24 @@ pub struct MarketState {
 
 impl MarketState {
     pub fn new(venue: VenueId, market_type: MarketType, symbol: impl Into<String>) -> Self {
+        let policy = SequencePolicy::default_for(venue, market_type);
+        Self::with_policy(venue, market_type, symbol, policy)
+    }
+
+    pub fn with_policy(
+        venue: VenueId,
+        market_type: MarketType,
+        symbol: impl Into<String>,
+        sequence_policy: SequencePolicy,
+    ) -> Self {
         let sym = symbol.into();
         Self {
             venue,
             market_type,
             symbol: sym.clone(),
+            sequence_policy,
+            epoch: 1,
+            awaiting_initial_covering: false,
             book: OrderBook::new(venue, market_type, sym),
             lifecycle_state: BookLifecycleState::AwaitingSnapshot,
             validity: BookValidity::Invalid(InvalidationReason::ManualInvalidation(
@@ -258,11 +299,13 @@ impl MarketState {
             "Resynchronization cycle initiated",
         )?;
         self.metrics.resync_attempts += 1;
+        self.epoch += 1;
 
         // Clear book state and buffer
         self.book = OrderBook::new(self.venue, self.market_type, &self.symbol);
         self.delta_buffer.clear();
         self.last_update_sequence = None;
+        self.awaiting_initial_covering = false;
         self.validity = BookValidity::Invalid(InvalidationReason::ManualInvalidation(
             "Resync in progress; awaiting snapshot".into(),
         ));
@@ -279,9 +322,9 @@ impl MarketState {
     /// For snapshot-only streams (e.g. Binance Spot depth20):
     /// - Directly updates and validates order book state.
     ///
-    /// For delta-streams (e.g. Binance USD-M Futures):
+    /// For delta-streams (e.g. Binance USD-M Futures, Bybit Linear):
     /// - Sets baseline snapshot, then drains and aligns all valid buffered deltas per the
-    ///   official Binance synchronization protocol.
+    ///   venue's sequence policy.
     pub fn apply_snapshot(
         &mut self,
         bids: Vec<PriceLevel>,
@@ -299,8 +342,16 @@ impl MarketState {
                 return Ok(false);
             }
             if sequence_id < last_seq {
-                self.metrics.old_deltas += 1;
-                return Ok(false);
+                if self.sequence_policy == SequencePolicy::SnapshotOnly {
+                    self.metrics.old_deltas += 1;
+                    return Ok(false);
+                } else {
+                    // For delta-based streams, an incoming snapshot with an older sequence ID
+                    // indicates a feed restart or resynchronization event from the exchange
+                    // (e.g. Bybit restart with u=1). This explicitly begins a new synchronization epoch.
+                    self.epoch += 1;
+                    self.last_update_sequence = None;
+                }
             }
         }
 
@@ -335,116 +386,169 @@ impl MarketState {
 
         let was_resyncing = self.metrics.resync_attempts > self.metrics.resync_successes;
 
-        // If deltas were buffered during AwaitingSnapshot, align them per Binance protocol
+        // If deltas were buffered during AwaitingSnapshot, align them per venue sequence policy
         if !self.delta_buffer.is_empty() {
             self.transition_to(
                 BookLifecycleState::Synchronizing,
                 "Aligning buffered deltas with snapshot",
             )?;
 
-            // 1. Drop obsolete buffered events where final update u < snapshot sequence S
-            while let Some(front) = self.delta_buffer.front() {
-                if front.sequence_id < sequence_id
-                    && front.prev_sequence_id.unwrap_or(0) < sequence_id
-                {
-                    self.delta_buffer.pop_front();
-                } else {
-                    break;
+            match self.sequence_policy {
+                SequencePolicy::SnapshotOnly => {
+                    self.delta_buffer.clear();
+                    self.last_update_sequence = Some(sequence_id);
                 }
-            }
+                SequencePolicy::MonotonicStrict => {
+                    // 1. Drop deltas at or before snapshot sequence
+                    while let Some(front) = self.delta_buffer.front() {
+                        if front.sequence_id <= sequence_id {
+                            self.delta_buffer.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
 
-            // 2. Identify the first valid event that covers or immediately follows sequence_id:
-            // Condition: (U <= S && u >= S) OR (pu == Some(S) || U == S + 1)
-            let mut current_u = sequence_id;
-
-            if let Some(first_match_idx) = self.delta_buffer.iter().position(|d| {
-                (d.first_sequence_id <= sequence_id && d.sequence_id >= sequence_id)
-                    || (d.prev_sequence_id == Some(sequence_id)
-                        || d.first_sequence_id == sequence_id + 1)
-            }) {
-                // Drop any unaligned events preceding the first match
-                for _ in 0..first_match_idx {
-                    self.delta_buffer.pop_front();
-                }
-
-                // Apply remaining buffered deltas in strict sequential order
-                while let Some(delta) = self.delta_buffer.pop_front() {
-                    // Continuity check:
-                    // If delta is the first applied and covers S, or pu == current_u
-                    let is_first_covering = delta.first_sequence_id <= sequence_id
-                        && delta.sequence_id >= sequence_id
-                        && current_u == sequence_id;
-
-                    if !is_first_covering {
-                        let pu_matches = delta.prev_sequence_id == Some(current_u);
-                        let contiguous_u = delta.first_sequence_id <= current_u + 1
-                            && delta.sequence_id > current_u;
-
-                        if !pu_matches && !contiguous_u {
-                            let gap = InvalidationReason::SequenceGap {
-                                expected_prev: current_u,
-                                received_prev: delta.prev_sequence_id,
-                                first_seq: delta.first_sequence_id,
-                                final_seq: delta.sequence_id,
+                    let mut current_u = sequence_id;
+                    while let Some(delta) = self.delta_buffer.pop_front() {
+                        if delta.sequence_id <= current_u {
+                            let reason = InvalidationReason::OutOfOrderUpdate {
+                                last_seq: current_u,
+                                received_seq: delta.sequence_id,
                             };
-                            self.invalidate(gap);
+                            self.invalidate(reason);
                             self.metrics.sequence_failures += 1;
-                            return Err(EngineError::SequenceGap {
-                                expected_prev: current_u,
-                                received_prev: delta.prev_sequence_id,
-                                first_seq: delta.first_sequence_id,
-                                final_seq: delta.sequence_id,
+                            return Err(EngineError::OutOfOrderUpdate {
+                                last_seq: current_u,
+                                received_seq: delta.sequence_id,
                             });
                         }
-                    }
 
-                    if let Err(err) = self.book.apply_delta(
-                        &delta.bids,
-                        &delta.asks,
-                        delta.exchange_ts_ms,
-                        delta.local_recv_ts_ns,
-                        delta.sequence_id,
-                    ) {
-                        if let EngineError::CrossedBook { bid, ask } = err {
-                            self.invalidate(InvalidationReason::CrossedBook { bid, ask });
-                            self.metrics.crossed_books += 1;
+                        if let Err(err) = self.book.apply_delta(
+                            &delta.bids,
+                            &delta.asks,
+                            delta.exchange_ts_ms,
+                            delta.local_recv_ts_ns,
+                            delta.sequence_id,
+                        ) {
+                            if let EngineError::CrossedBook { bid, ask } = err {
+                                self.invalidate(InvalidationReason::CrossedBook { bid, ask });
+                                self.metrics.crossed_books += 1;
+                            }
+                            return Err(err);
                         }
-                        return Err(err);
+
+                        current_u = delta.sequence_id;
+                        self.metrics.deltas_applied += 1;
+                    }
+                    self.last_update_sequence = Some(current_u);
+                }
+                SequencePolicy::ContiguousPrevious => {
+                    // 1. Drop obsolete buffered events where final update u < snapshot sequence S
+                    while let Some(front) = self.delta_buffer.front() {
+                        if front.sequence_id < sequence_id
+                            && front.prev_sequence_id.unwrap_or(0) < sequence_id
+                        {
+                            self.delta_buffer.pop_front();
+                        } else {
+                            break;
+                        }
                     }
 
-                    current_u = delta.sequence_id;
-                    self.metrics.deltas_applied += 1;
-                }
-            } else if !self.delta_buffer.is_empty() {
-                // Remaining deltas have a sequence gap beyond the snapshot
-                let (first_seq, final_seq, prev_seq) = {
-                    let front = &self.delta_buffer[0];
-                    (
-                        front.first_sequence_id,
-                        front.sequence_id,
-                        front.prev_sequence_id,
-                    )
-                };
-                let gap = InvalidationReason::SequenceGap {
-                    expected_prev: sequence_id,
-                    received_prev: prev_seq,
-                    first_seq,
-                    final_seq,
-                };
-                self.invalidate(gap);
-                self.metrics.sequence_failures += 1;
-                self.delta_buffer.clear();
-                return Err(EngineError::SequenceGap {
-                    expected_prev: sequence_id,
-                    received_prev: prev_seq,
-                    first_seq,
-                    final_seq,
-                });
-            }
+                    // 2. Identify the first valid event that covers or immediately follows sequence_id:
+                    // Condition: (U <= S && u >= S) OR (pu == Some(S) || U == S + 1)
+                    let mut current_u = sequence_id;
 
-            self.last_update_sequence = Some(current_u);
+                    if let Some(first_match_idx) = self.delta_buffer.iter().position(|d| {
+                        (d.first_sequence_id <= sequence_id && d.sequence_id >= sequence_id)
+                            || (d.prev_sequence_id == Some(sequence_id)
+                                || d.first_sequence_id == sequence_id + 1)
+                    }) {
+                        // Drop any unaligned events preceding the first match
+                        for _ in 0..first_match_idx {
+                            self.delta_buffer.pop_front();
+                        }
+
+                        // Apply remaining buffered deltas in strict sequential order
+                        while let Some(delta) = self.delta_buffer.pop_front() {
+                            let is_first_covering = delta.first_sequence_id <= sequence_id
+                                && delta.sequence_id >= sequence_id
+                                && current_u == sequence_id;
+
+                            if !is_first_covering {
+                                let pu_matches = delta.prev_sequence_id == Some(current_u);
+                                let contiguous_u = delta.first_sequence_id <= current_u + 1
+                                    && delta.sequence_id > current_u;
+
+                                if !pu_matches && !contiguous_u {
+                                    let gap = InvalidationReason::SequenceGap {
+                                        expected_prev: current_u,
+                                        received_prev: delta.prev_sequence_id,
+                                        first_seq: delta.first_sequence_id,
+                                        final_seq: delta.sequence_id,
+                                    };
+                                    self.invalidate(gap);
+                                    self.metrics.sequence_failures += 1;
+                                    return Err(EngineError::SequenceGap {
+                                        expected_prev: current_u,
+                                        received_prev: delta.prev_sequence_id,
+                                        first_seq: delta.first_sequence_id,
+                                        final_seq: delta.sequence_id,
+                                    });
+                                }
+                            }
+
+                            if let Err(err) = self.book.apply_delta(
+                                &delta.bids,
+                                &delta.asks,
+                                delta.exchange_ts_ms,
+                                delta.local_recv_ts_ns,
+                                delta.sequence_id,
+                            ) {
+                                if let EngineError::CrossedBook { bid, ask } = err {
+                                    self.invalidate(InvalidationReason::CrossedBook { bid, ask });
+                                    self.metrics.crossed_books += 1;
+                                }
+                                return Err(err);
+                            }
+
+                            current_u = delta.sequence_id;
+                            self.metrics.deltas_applied += 1;
+                        }
+                    } else if !self.delta_buffer.is_empty() {
+                        // Remaining deltas have a sequence gap beyond the snapshot
+                        let (first_seq, final_seq, prev_seq) = {
+                            let front = &self.delta_buffer[0];
+                            (
+                                front.first_sequence_id,
+                                front.sequence_id,
+                                front.prev_sequence_id,
+                            )
+                        };
+                        let gap = InvalidationReason::SequenceGap {
+                            expected_prev: sequence_id,
+                            received_prev: prev_seq,
+                            first_seq,
+                            final_seq,
+                        };
+                        self.invalidate(gap);
+                        self.metrics.sequence_failures += 1;
+                        self.delta_buffer.clear();
+                        return Err(EngineError::SequenceGap {
+                            expected_prev: sequence_id,
+                            received_prev: prev_seq,
+                            first_seq,
+                            final_seq,
+                        });
+                    }
+
+                    self.last_update_sequence = Some(current_u);
+                }
+            }
+            self.awaiting_initial_covering = false;
         } else {
             self.last_update_sequence = Some(sequence_id);
+            self.awaiting_initial_covering =
+                self.sequence_policy == SequencePolicy::ContiguousPrevious;
         }
 
         self.last_exchange_ts_ms = Some(exchange_ts_ms);
@@ -464,9 +568,10 @@ impl MarketState {
 
     /// Apply an incremental order book delta update.
     ///
-    /// - If `AwaitingSnapshot` or `Synchronizing`: buffers the delta.
-    /// - If `Invalidated`: rejects mutation until resynchronization.
-    /// - If `Live`: strictly checks sequence continuity (`pu == previous.u`).
+    /// - If `AwaitingSnapshot`: buffers the delta.
+    /// - If `Synchronizing`: validates and applies the initial covering delta, transitioning to `Live`.
+    /// - If `Invalidated` or `Resyncing`: rejects mutation until resynchronization.
+    /// - If `Live`: strictly checks sequence continuity per `self.sequence_policy`.
     ///   Detects duplicate/old events, mutates the order book, and checks crossed-book invariants.
     pub fn apply_delta(&mut self, delta: DeltaUpdate) -> Result<bool> {
         let DeltaUpdate {
@@ -488,9 +593,7 @@ impl MarketState {
         }
 
         match self.lifecycle_state {
-            BookLifecycleState::Empty
-            | BookLifecycleState::AwaitingSnapshot
-            | BookLifecycleState::Synchronizing => {
+            BookLifecycleState::Empty | BookLifecycleState::AwaitingSnapshot => {
                 self.metrics.deltas_received += 1;
                 if self.delta_buffer.len() >= self.max_buffered_deltas {
                     self.delta_buffer.pop_front();
@@ -514,53 +617,199 @@ impl MarketState {
                     self.lifecycle_state
                 )))
             }
+            BookLifecycleState::Synchronizing => {
+                self.metrics.deltas_received += 1;
+                let last_u = self.last_update_sequence.unwrap_or(0);
+
+                match self.sequence_policy {
+                    SequencePolicy::SnapshotOnly => Err(EngineError::Validation(
+                        "Delta updates are not supported for SnapshotOnly sequence policy".into(),
+                    )),
+                    SequencePolicy::MonotonicStrict => {
+                        if sequence_id <= last_u {
+                            self.metrics.sequence_failures += 1;
+                            let reason = InvalidationReason::OutOfOrderUpdate {
+                                last_seq: last_u,
+                                received_seq: sequence_id,
+                            };
+                            self.invalidate(reason);
+                            return Err(EngineError::OutOfOrderUpdate {
+                                last_seq: last_u,
+                                received_seq: sequence_id,
+                            });
+                        }
+
+                        if let Err(err) = self.book.apply_delta(
+                            &bids,
+                            &asks,
+                            exchange_ts_ms,
+                            local_recv_ts_ns,
+                            sequence_id,
+                        ) {
+                            if let EngineError::CrossedBook { bid, ask } = err {
+                                self.invalidate(InvalidationReason::CrossedBook { bid, ask });
+                                self.metrics.crossed_books += 1;
+                            }
+                            return Err(err);
+                        }
+
+                        if self.book.bids.is_empty() && self.book.asks.is_empty() {
+                            self.invalidate(InvalidationReason::EmptyBook);
+                            return Err(EngineError::DataQuality("Book emptied by delta".into()));
+                        }
+
+                        self.last_update_sequence = Some(sequence_id);
+                        self.last_exchange_ts_ms = Some(exchange_ts_ms);
+                        self.last_local_recv_ts_ns = Some(local_recv_ts_ns);
+                        self.metrics.deltas_applied += 1;
+                        self.awaiting_initial_covering = false;
+                        self.transition_to(
+                            BookLifecycleState::Live,
+                            "Initial monotonic update synchronized; book is Live",
+                        )?;
+                        self.validity = BookValidity::Valid;
+                        Ok(true)
+                    }
+                    SequencePolicy::ContiguousPrevious => {
+                        if sequence_id < last_u {
+                            self.metrics.old_deltas += 1;
+                            return Ok(false);
+                        }
+
+                        let is_covering = (first_sequence_id <= last_u && sequence_id >= last_u)
+                            || prev_sequence_id == Some(last_u)
+                            || (first_sequence_id <= last_u + 1 && sequence_id > last_u);
+
+                        if !is_covering {
+                            let gap = InvalidationReason::SequenceGap {
+                                expected_prev: last_u,
+                                received_prev: prev_sequence_id,
+                                first_seq: first_sequence_id,
+                                final_seq: sequence_id,
+                            };
+                            self.invalidate(gap);
+                            self.metrics.sequence_failures += 1;
+                            return Err(EngineError::SequenceGap {
+                                expected_prev: last_u,
+                                received_prev: prev_sequence_id,
+                                first_seq: first_sequence_id,
+                                final_seq: sequence_id,
+                            });
+                        }
+
+                        if let Err(err) = self.book.apply_delta(
+                            &bids,
+                            &asks,
+                            exchange_ts_ms,
+                            local_recv_ts_ns,
+                            sequence_id,
+                        ) {
+                            if let EngineError::CrossedBook { bid, ask } = err {
+                                self.invalidate(InvalidationReason::CrossedBook { bid, ask });
+                                self.metrics.crossed_books += 1;
+                            }
+                            return Err(err);
+                        }
+
+                        if self.book.bids.is_empty() && self.book.asks.is_empty() {
+                            self.invalidate(InvalidationReason::EmptyBook);
+                            return Err(EngineError::DataQuality("Book emptied by delta".into()));
+                        }
+
+                        self.last_update_sequence = Some(sequence_id);
+                        self.last_exchange_ts_ms = Some(exchange_ts_ms);
+                        self.last_local_recv_ts_ns = Some(local_recv_ts_ns);
+                        self.metrics.deltas_applied += 1;
+                        self.awaiting_initial_covering = false;
+                        self.transition_to(
+                            BookLifecycleState::Live,
+                            "Covering delta applied; book is Live",
+                        )?;
+                        self.validity = BookValidity::Valid;
+                        Ok(true)
+                    }
+                }
+            }
             BookLifecycleState::Live => {
                 self.metrics.deltas_received += 1;
                 let last_u = self.last_update_sequence.unwrap_or(0);
 
-                // Duplicate check
-                if sequence_id == last_u {
-                    self.metrics.duplicate_deltas += 1;
-                    return Ok(false);
-                }
-
-                // Old / already applied update check
-                if sequence_id < last_u {
-                    self.metrics.old_deltas += 1;
-                    return Ok(false);
-                }
-
-                // Stream continuity check:
-                // Official Binance USD-M Futures protocol:
-                // 1. The first event following a snapshot satisfies: U <= lastUpdateId && u >= lastUpdateId
-                // 2. Each subsequent event's pu MUST correspond to previous event's u
-                let is_first_covering_snapshot =
-                    first_sequence_id <= last_u && sequence_id >= last_u;
-
-                let continuity_ok = if is_first_covering_snapshot {
-                    true
-                } else {
-                    match prev_sequence_id {
-                        Some(pu) => pu == last_u,
-                        None => first_sequence_id <= last_u + 1 && sequence_id > last_u,
+                match self.sequence_policy {
+                    SequencePolicy::SnapshotOnly => {
+                        return Err(EngineError::Validation(
+                            "Delta updates are not supported for SnapshotOnly sequence policy"
+                                .into(),
+                        ));
                     }
-                };
+                    SequencePolicy::MonotonicStrict => {
+                        // In Bybit-compatible streams, sequence_id MUST be strictly greater than last_u.
+                        // Duplicates (sequence_id == last_u) and decrements (sequence_id < last_u)
+                        // indicate lost ordering or unaligned retransmissions and MUST fail closed.
+                        if sequence_id <= last_u {
+                            if sequence_id == last_u {
+                                self.metrics.duplicate_deltas += 1;
+                            } else {
+                                self.metrics.old_deltas += 1;
+                            }
+                            self.metrics.sequence_failures += 1;
+                            let reason = InvalidationReason::OutOfOrderUpdate {
+                                last_seq: last_u,
+                                received_seq: sequence_id,
+                            };
+                            self.invalidate(reason);
+                            return Err(EngineError::OutOfOrderUpdate {
+                                last_seq: last_u,
+                                received_seq: sequence_id,
+                            });
+                        }
+                    }
+                    SequencePolicy::ContiguousPrevious => {
+                        // Check for duplicate delta
+                        if sequence_id == last_u {
+                            self.metrics.duplicate_deltas += 1;
+                            return Ok(false);
+                        }
 
-                if !continuity_ok {
-                    let gap = InvalidationReason::SequenceGap {
-                        expected_prev: last_u,
-                        received_prev: prev_sequence_id,
-                        first_seq: first_sequence_id,
-                        final_seq: sequence_id,
-                    };
-                    self.invalidate(gap);
-                    self.metrics.sequence_failures += 1;
-                    return Err(EngineError::SequenceGap {
-                        expected_prev: last_u,
-                        received_prev: prev_sequence_id,
-                        first_seq: first_sequence_id,
-                        final_seq: sequence_id,
-                    });
+                        // Check for old delta
+                        if sequence_id < last_u {
+                            self.metrics.old_deltas += 1;
+                            return Ok(false);
+                        }
+
+                        // One-time covering exception vs strict normal continuity:
+                        // The covering exception (U <= last_u <= u) is allowed ONLY ONCE
+                        // during initial synchronization. Once consumed or in Live,
+                        // strict contiguous previous update semantics (pu == last_u) are enforced.
+                        let continuity_ok = if self.awaiting_initial_covering {
+                            self.awaiting_initial_covering = false;
+                            (first_sequence_id <= last_u && sequence_id >= last_u)
+                                || prev_sequence_id == Some(last_u)
+                                || (first_sequence_id <= last_u + 1 && sequence_id > last_u)
+                        } else {
+                            // Strict continuity: incoming.pu == previous_accepted_u
+                            match prev_sequence_id {
+                                Some(pu) => pu == last_u,
+                                None => false,
+                            }
+                        };
+
+                        if !continuity_ok {
+                            let gap = InvalidationReason::SequenceGap {
+                                expected_prev: last_u,
+                                received_prev: prev_sequence_id,
+                                first_seq: first_sequence_id,
+                                final_seq: sequence_id,
+                            };
+                            self.invalidate(gap);
+                            self.metrics.sequence_failures += 1;
+                            return Err(EngineError::SequenceGap {
+                                expected_prev: last_u,
+                                received_prev: prev_sequence_id,
+                                first_seq: first_sequence_id,
+                                final_seq: sequence_id,
+                            });
+                        }
+                    }
                 }
 
                 // Apply delta to internal order book
@@ -592,6 +841,21 @@ impl MarketState {
                 Ok(true)
             }
         }
+    }
+
+    /// Current synchronization epoch counter.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Sequence policy configured for this instrument.
+    pub fn sequence_policy(&self) -> SequencePolicy {
+        self.sequence_policy
+    }
+
+    /// Check if the state is currently awaiting its initial covering update.
+    pub fn is_awaiting_initial_covering(&self) -> bool {
+        self.awaiting_initial_covering
     }
 
     /// Check if the market state is stale relative to a given duration threshold.
