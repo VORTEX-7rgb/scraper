@@ -100,6 +100,8 @@ pub enum MarketEvent {
     /// Connection state lifecycle event.
     ConnectionState {
         venue: VenueId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        market_type: Option<MarketType>,
         is_connected: bool,
         details: String,
     },

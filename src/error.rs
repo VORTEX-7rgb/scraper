@@ -28,6 +28,9 @@ pub enum EngineError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("Invalid execution quantity: {0}. Quantity must be strictly positive.")]
+    InvalidQuantity(rust_decimal::Decimal),
+
     #[error("Data quality error: {0}")]
     DataQuality(String),
 

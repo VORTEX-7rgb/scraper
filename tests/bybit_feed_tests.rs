@@ -297,7 +297,7 @@ fn test_m3_1_heartbeat_handling() {
     let ping_json = serde_json::to_string(&ping).unwrap();
     assert_eq!(ping_json, r#"{"op":"ping"}"#);
 
-    // Parse pong
+    // Parse pong (format 1: op == pong)
     let pong_json = r#"{
         "op": "pong",
         "args": ["1727400000000"],
@@ -310,6 +310,21 @@ fn test_m3_1_heartbeat_handling() {
             assert_eq!(conn_id, Some("2324d924-aa4d-45b0-a858-7b8be29ab52b".into()));
         }
         other => panic!("Expected Pong, got: {:?}", other),
+    }
+
+    // Parse pong (format 2: op == ping with ret_msg == pong as observed live)
+    let live_pong_json = r#"{
+        "success": true,
+        "ret_msg": "pong",
+        "conn_id": "d9avu63jf06b2lc5o2ig-eptrh",
+        "op": "ping"
+    }"#;
+    let parsed_live = parse_bybit_message(live_pong_json).expect("Should parse live pong response");
+    match parsed_live {
+        BybitParsedMessage::Pong { conn_id, .. } => {
+            assert_eq!(conn_id, Some("d9avu63jf06b2lc5o2ig-eptrh".into()));
+        }
+        other => panic!("Expected Pong for live ping/pong ack, got: {:?}", other),
     }
 }
 

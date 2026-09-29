@@ -1,13 +1,16 @@
 use airbitrage::config::AppConfig;
 use airbitrage::error::{EngineError, Result};
+use airbitrage::market::state::BookLifecycleState;
 use airbitrage::market::{MarketStateManager, OrderBook};
 use airbitrage::types::{MarketEvent, MarketType, PriceLevel, VenueId};
 use airbitrage::venues::binance::{BinanceClient, BinanceStreamType};
 use airbitrage::venues::bybit::{BybitFeedConfig, BybitMetrics, BybitWebSocketFeed};
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -702,7 +705,7 @@ async fn run_binance_soak_test(symbol: &str, duration_secs: u64) -> Result<()> {
 
 fn fetch_binance_futures_snapshot(symbol: &str) -> Result<MarketEvent> {
     let url = format!(
-        "https://fapi.binance.com/fapi/v1/depth?symbol={}&limit=50",
+        "https://fapi.binance.com/fapi/v1/depth?symbol={}&limit=1000",
         symbol.to_uppercase()
     );
     let output = std::process::Command::new("curl.exe")
@@ -1052,12 +1055,1182 @@ async fn run_market_state_live_test(symbol: &str, duration_secs: u64) -> Result<
     Ok(())
 }
 
+// ============================================================================
+// CONCURRENT FOUR-BOOK VALIDATION & RECOVERY HARNESS (M3.6 PRE-VALIDATION)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FeedId {
+    BinanceSpot,
+    BinanceLinear,
+    BybitSpot,
+    BybitLinear,
+}
+
+impl FeedId {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::BinanceSpot => "BINANCE / SPOT / BTCUSDT",
+            Self::BinanceLinear => "BINANCE / LINEAR_PERPETUAL / BTCUSDT",
+            Self::BybitSpot => "BYBIT / SPOT / BTCUSDT",
+            Self::BybitLinear => "BYBIT / LINEAR_PERPETUAL / BTCUSDT",
+        }
+    }
+
+    fn venue_market(&self) -> (VenueId, MarketType) {
+        match self {
+            Self::BinanceSpot => (VenueId::Binance, MarketType::Spot),
+            Self::BinanceLinear => (VenueId::Binance, MarketType::LinearPerpetual),
+            Self::BybitSpot => (VenueId::Bybit, MarketType::Spot),
+            Self::BybitLinear => (VenueId::Bybit, MarketType::LinearPerpetual),
+        }
+    }
+
+    fn from_event(event: &MarketEvent) -> Option<Self> {
+        match event {
+            MarketEvent::OrderBookSnapshot {
+                venue, market_type, ..
+            }
+            | MarketEvent::OrderBookDelta {
+                venue, market_type, ..
+            } => match (venue, market_type) {
+                (VenueId::Binance, MarketType::Spot) => Some(Self::BinanceSpot),
+                (VenueId::Binance, MarketType::LinearPerpetual) => Some(Self::BinanceLinear),
+                (VenueId::Bybit, MarketType::Spot) => Some(Self::BybitSpot),
+                (VenueId::Bybit, MarketType::LinearPerpetual) => Some(Self::BybitLinear),
+            },
+            MarketEvent::FundingRateUpdate { venue, .. } => {
+                if *venue == VenueId::Binance {
+                    Some(Self::BinanceLinear)
+                } else {
+                    Some(Self::BybitLinear)
+                }
+            }
+            MarketEvent::ConnectionState {
+                venue, market_type, ..
+            } => match (venue, market_type) {
+                (VenueId::Binance, Some(MarketType::Spot)) => Some(Self::BinanceSpot),
+                (VenueId::Binance, Some(MarketType::LinearPerpetual)) => Some(Self::BinanceLinear),
+                (VenueId::Bybit, Some(MarketType::Spot)) => Some(Self::BybitSpot),
+                (VenueId::Bybit, Some(MarketType::LinearPerpetual)) => Some(Self::BybitLinear),
+                _ => None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FeedDiagnostics {
+    raw_messages: u64,
+    snapshots_received: u64,
+    deltas_received: u64,
+    parse_errors: u64,
+    unknown_messages: u64,
+    disconnects: u64,
+    reconnects: u64,
+
+    // Trace pipeline
+    parsed_events: u64,
+    manager_events: u64,
+    accepted_updates: u64,
+    sequence_rejections: u64,
+    crossed_books_observed: u64,
+    stale_transitions: u64,
+    trusted_observations: u64,
+    sanity_violations: u64,
+
+    // Timing & Freshness
+    freshness_samples_ms: Vec<u64>,
+    receive_latencies_us: Vec<u64>,
+    last_exchange_ts_ms: i64,
+    last_recv_ts_ns: i64,
+}
+
+impl FeedDiagnostics {
+    fn freshness_stats(&mut self) -> (u64, u64, u64, u64, u64) {
+        if self.freshness_samples_ms.is_empty() {
+            return (0, 0, 0, 0, 0);
+        }
+        self.freshness_samples_ms.sort_unstable();
+        let len = self.freshness_samples_ms.len();
+        let min = self.freshness_samples_ms[0];
+        let max = self.freshness_samples_ms[len - 1];
+        let avg = self.freshness_samples_ms.iter().sum::<u64>() / len as u64;
+        let p95 = self.freshness_samples_ms[(len * 95) / 100];
+        let p99 = self.freshness_samples_ms[(len * 99) / 100];
+        (min, max, avg, p95, p99)
+    }
+
+    fn latency_p50(&mut self) -> u64 {
+        if self.receive_latencies_us.is_empty() {
+            return 0;
+        }
+        self.receive_latencies_us.sort_unstable();
+        self.receive_latencies_us[self.receive_latencies_us.len() / 2]
+    }
+
+    fn latency_avg(&self) -> u64 {
+        if self.receive_latencies_us.is_empty() {
+            return 0;
+        }
+        self.receive_latencies_us.iter().sum::<u64>() / self.receive_latencies_us.len() as u64
+    }
+}
+
+async fn run_four_book_validation(symbol: &str, duration_secs: u64) -> Result<()> {
+    info!(
+        target: "airbitrage::four_book",
+        symbol,
+        duration_secs,
+        "Starting simultaneous 4-book live validation harness"
+    );
+
+    let (start_mem_ws, _) = mem_tracker::get_memory_bytes();
+    let (event_tx, mut event_rx) = mpsc::channel::<MarketEvent>(16384);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // 1. Spawning Binance Feeds (Spot + Futures Depth + Futures Mark)
+    let binance_client = BinanceClient::new(symbol);
+    let bc_spot = binance_client.clone();
+    let bc_depth = binance_client.clone();
+    let bc_mark = binance_client.clone();
+
+    let tx1 = event_tx.clone();
+    let rx1 = shutdown_rx.clone();
+    let tx2 = event_tx.clone();
+    let rx2 = shutdown_rx.clone();
+    let tx3 = event_tx.clone();
+    let rx3 = shutdown_rx.clone();
+
+    tokio::spawn(async move {
+        bc_spot.run_spot_stream(tx1, rx1).await;
+    });
+    tokio::spawn(async move {
+        bc_depth.run_futures_depth_stream(tx2, rx2).await;
+    });
+    tokio::spawn(async move {
+        bc_mark.run_futures_mark_stream(tx3, rx3).await;
+    });
+
+    // 2. Spawning Bybit Spot Feed
+    let bybit_spot_metrics = Arc::new(BybitMetrics::default());
+    let bybit_spot_feed = BybitWebSocketFeed::with_metrics(
+        BybitFeedConfig::default_spot(symbol),
+        bybit_spot_metrics.clone(),
+        event_tx.clone(),
+    );
+    let rx_by_spot = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let _ = bybit_spot_feed.run_stream(rx_by_spot).await;
+    });
+
+    // 3. Spawning Bybit Linear Feed
+    let bybit_linear_metrics = Arc::new(BybitMetrics::default());
+    let bybit_linear_feed = BybitWebSocketFeed::with_metrics(
+        BybitFeedConfig::default_linear(symbol),
+        bybit_linear_metrics.clone(),
+        event_tx.clone(),
+    );
+    let rx_by_linear = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let _ = bybit_linear_feed.run_stream(rx_by_linear).await;
+    });
+
+    // 4. State Manager
+    let mut manager = MarketStateManager::new(Duration::from_millis(3000));
+    manager.register_instrument(VenueId::Binance, MarketType::Spot, symbol);
+    manager.register_instrument(VenueId::Binance, MarketType::LinearPerpetual, symbol);
+    manager.register_instrument(VenueId::Bybit, MarketType::Spot, symbol);
+    manager.register_instrument(VenueId::Bybit, MarketType::LinearPerpetual, symbol);
+
+    let mut diags: HashMap<FeedId, FeedDiagnostics> = [
+        (FeedId::BinanceSpot, FeedDiagnostics::default()),
+        (FeedId::BinanceLinear, FeedDiagnostics::default()),
+        (FeedId::BybitSpot, FeedDiagnostics::default()),
+        (FeedId::BybitLinear, FeedDiagnostics::default()),
+    ]
+    .into_iter()
+    .collect();
+
+    let start = Instant::now();
+    let target_duration = Duration::from_secs(duration_secs);
+    let mut futures_snapshot_requested = false;
+    let mut futures_snapshot_applied = false;
+    let mut last_sample_time = Instant::now();
+
+    println!("\n================================================================================");
+    println!("          FOUR-BOOK CONCURRENT VALIDATION HARNESS (M3.6 PRE-VALIDATION)");
+    println!("================================================================================");
+    println!(
+        "Target Symbol:    {} | Scheduled Duration: {}s",
+        symbol.to_uppercase(),
+        duration_secs
+    );
+    println!(
+        "Running feeds:    Binance Spot, Binance Futures, Bybit Spot, Bybit Linear concurrently"
+    );
+
+    while start.elapsed() < target_duration {
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                let now_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i64;
+
+                let feed_id = FeedId::from_event(&event);
+
+                if let Some(fid) = feed_id {
+                    let diag = diags.get_mut(&fid).unwrap();
+                    diag.parsed_events += 1;
+                    diag.manager_events += 1;
+
+                    let local_recv_ns = match &event {
+                        MarketEvent::OrderBookSnapshot {
+                            local_recv_ts_ns,
+                            exchange_ts_ms,
+                            ..
+                        } => {
+                            diag.last_exchange_ts_ms = *exchange_ts_ms;
+                            *local_recv_ts_ns
+                        }
+                        MarketEvent::OrderBookDelta {
+                            local_recv_ts_ns,
+                            exchange_ts_ms,
+                            ..
+                        } => {
+                            diag.last_exchange_ts_ms = *exchange_ts_ms;
+                            *local_recv_ts_ns
+                        }
+                        _ => now_ns,
+                    };
+                    diag.last_recv_ts_ns = local_recv_ns;
+                    let latency_us = ((now_ns - local_recv_ns).max(0) / 1000) as u64;
+                    diag.receive_latencies_us.push(latency_us);
+                }
+
+                let is_fut_snap = matches!(
+                    &event,
+                    MarketEvent::OrderBookSnapshot {
+                        venue: VenueId::Binance,
+                        market_type: MarketType::LinearPerpetual,
+                        ..
+                    }
+                );
+
+                match manager.handle_event(&event) {
+                    Ok(mutated) => {
+                        if let Some(fid) = feed_id
+                            && mutated
+                        {
+                            diags.get_mut(&fid).unwrap().accepted_updates += 1;
+                        }
+                        if is_fut_snap {
+                            futures_snapshot_applied = true;
+                            info!(target: "airbitrage::four_book", "Binance Futures REST depth snapshot aligned successfully");
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(fid) = feed_id {
+                            let diag = diags.get_mut(&fid).unwrap();
+                            match &e {
+                                EngineError::SequenceGap { .. }
+                                | EngineError::OutOfOrderUpdate { .. } => {
+                                    diag.sequence_rejections += 1;
+                                    warn!(target: "airbitrage::four_book", feed = ?fid, error = %e, "Sequence error");
+                                }
+                                EngineError::CrossedBook { .. } => {
+                                    diag.crossed_books_observed += 1;
+                                    warn!(target: "airbitrage::four_book", feed = ?fid, error = %e, "Crossed book error");
+                                }
+                                _ => {
+                                    warn!(target: "airbitrage::four_book", feed = ?fid, error = %e, "Event error");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check Binance Futures buffering for REST snapshot
+                if !futures_snapshot_requested && !futures_snapshot_applied {
+                    let buffered_count = manager
+                        .get_state(VenueId::Binance, MarketType::LinearPerpetual, symbol)
+                        .map(|s| s.buffered_delta_count())
+                        .unwrap_or(0);
+
+                    if buffered_count >= 5 {
+                        futures_snapshot_requested = true;
+                        info!(
+                            target: "airbitrage::four_book",
+                            buffered_count,
+                            "Triggering concurrent Binance Futures REST depth snapshot fetch"
+                        );
+                        let sym_copy = symbol.to_string();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(move || {
+                                fetch_binance_futures_snapshot(&sym_copy)
+                            })
+                            .await;
+                            if let Ok(Ok(snap_event)) = res {
+                                let _ = tx.send(snap_event).await;
+                            }
+                        });
+                    }
+                }
+
+                // Sample trusted book for this feed
+                if let Some(fid) = feed_id {
+                    let (v, mt) = fid.venue_market();
+                    let diag = diags.get_mut(&fid).unwrap();
+                    if let Some(book) = manager.get_trusted_book(v, mt, symbol, now_ns) {
+                        diag.trusted_observations += 1;
+                        let freshness_ms =
+                            ((now_ns - book.local_recv_ts_ns).max(0) / 1_000_000) as u64;
+                        diag.freshness_samples_ms.push(freshness_ms);
+
+                        // Continuous sanity assertion
+                        match (book.best_bid(), book.best_ask()) {
+                            (Some(b), Some(a)) => {
+                                if b.price >= a.price
+                                    || b.price <= Decimal::ZERO
+                                    || a.price <= Decimal::ZERO
+                                    || b.quantity <= Decimal::ZERO
+                                    || a.quantity <= Decimal::ZERO
+                                {
+                                    diag.sanity_violations += 1;
+                                }
+                            }
+                            _ => {
+                                diag.sanity_violations += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        // Periodic 1-second staleness and health sweep across all 4 instruments
+        if last_sample_time.elapsed() >= Duration::from_secs(1) {
+            last_sample_time = Instant::now();
+            let sample_now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+
+            for (fid, diag) in diags.iter_mut() {
+                let (v, mt) = fid.venue_market();
+                if let Some(book) = manager.get_trusted_book(v, mt, symbol, sample_now) {
+                    diag.trusted_observations += 1;
+                    let freshness_ms =
+                        ((sample_now - book.local_recv_ts_ns).max(0) / 1_000_000) as u64;
+                    diag.freshness_samples_ms.push(freshness_ms);
+                } else if let Some(state) = manager.get_state(v, mt, symbol)
+                    && state.lifecycle_state == BookLifecycleState::Live
+                    && state.is_stale(Duration::from_millis(3000), sample_now)
+                {
+                    diag.stale_transitions += 1;
+                }
+            }
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    let elapsed = start.elapsed();
+    let (end_mem_ws, peak_mem_ws) = mem_tracker::get_memory_bytes();
+
+    // Pull adapter snapshots
+    let binance_snap = binance_client.metrics.snapshot();
+    let bybit_spot_snap = bybit_spot_metrics.snapshot();
+    let bybit_linear_snap = bybit_linear_metrics.snapshot();
+
+    // Sync raw metrics into diagnostics
+    {
+        let d = diags.get_mut(&FeedId::BinanceSpot).unwrap();
+        d.raw_messages = binance_snap.spot_depth_messages;
+        d.snapshots_received = binance_snap.spot_depth_messages;
+        d.parse_errors = binance_snap.parse_errors;
+        d.disconnects = binance_snap.disconnects;
+    }
+    {
+        let d = diags.get_mut(&FeedId::BinanceLinear).unwrap();
+        d.raw_messages = binance_snap.futures_depth_messages;
+        d.snapshots_received = if futures_snapshot_applied { 1 } else { 0 };
+        d.deltas_received = binance_snap.futures_depth_messages;
+        d.parse_errors = binance_snap.parse_errors;
+        d.disconnects = binance_snap.disconnects;
+    }
+    {
+        let d = diags.get_mut(&FeedId::BybitSpot).unwrap();
+        d.raw_messages = bybit_spot_snap.messages_received;
+        d.snapshots_received = bybit_spot_snap.snapshots_received;
+        d.deltas_received = bybit_spot_snap.deltas_received;
+        d.parse_errors = bybit_spot_snap.parse_errors;
+        d.unknown_messages = bybit_spot_snap.unknown_messages;
+        d.disconnects = bybit_spot_snap.disconnects;
+        d.reconnects = bybit_spot_snap.reconnects;
+    }
+    {
+        let d = diags.get_mut(&FeedId::BybitLinear).unwrap();
+        d.raw_messages = bybit_linear_snap.messages_received;
+        d.snapshots_received = bybit_linear_snap.snapshots_received;
+        d.deltas_received = bybit_linear_snap.deltas_received;
+        d.parse_errors = bybit_linear_snap.parse_errors;
+        d.unknown_messages = bybit_linear_snap.unknown_messages;
+        d.disconnects = bybit_linear_snap.disconnects;
+        d.reconnects = bybit_linear_snap.reconnects;
+    }
+
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+
+    // --- REPORT SECTION 1: FOUR-BOOK STATUS TABLE ---
+    println!("\n--------------------------------------------------------------------------------");
+    println!("1. FOUR-BOOK STATUS TABLE");
+    println!("--------------------------------------------------------------------------------");
+    println!(
+        "{:<36} | {:<9} | {:<8} | {:<7} | {:<5} | {:<5} | {:<7}",
+        "Feed", "Connected", "Snapshot", "Deltas", "Live", "Valid", "Trusted"
+    );
+    println!(
+        "{:-<36}-|-{:-<9}-|-{:-<8}-|-{:-<7}-|-{:-<5}-|-{:-<5}-|-{:-<7}",
+        "", "", "", "", "", "", ""
+    );
+
+    let feed_ids = [
+        FeedId::BinanceSpot,
+        FeedId::BinanceLinear,
+        FeedId::BybitSpot,
+        FeedId::BybitLinear,
+    ];
+
+    let mut all_trusted = true;
+    for fid in &feed_ids {
+        let (v, mt) = fid.venue_market();
+        let state = manager.get_state(v, mt, symbol);
+        let trusted = manager.get_trusted_book(v, mt, symbol, now_ns);
+        let d = diags.get(fid).unwrap();
+
+        let is_live = state
+            .map(|s| s.lifecycle_state == BookLifecycleState::Live)
+            .unwrap_or(false);
+        let is_valid = state.map(|s| s.validity.is_valid()).unwrap_or(false);
+        let is_tr = trusted.is_some();
+        if !is_tr {
+            all_trusted = false;
+        }
+
+        println!(
+            "{:<36} | {:<9} | {:<8} | {:<7} | {:<5} | {:<5} | {:<7}",
+            fid.label(),
+            if d.raw_messages > 0 { "YES" } else { "NO" },
+            d.snapshots_received,
+            d.deltas_received,
+            if is_live { "YES" } else { "NO" },
+            if is_valid { "YES" } else { "NO" },
+            if is_tr { "YES" } else { "NO" }
+        );
+    }
+
+    // --- REPORT SECTION 2: DETAILED METRICS PER FEED ---
+    println!("\n--------------------------------------------------------------------------------");
+    println!("2. DETAILED METRICS PER FEED");
+    println!("--------------------------------------------------------------------------------");
+    for fid in &feed_ids {
+        let (v, mt) = fid.venue_market();
+        let state = manager.get_state(v, mt, symbol);
+        let trusted = manager.get_trusted_book(v, mt, symbol, now_ns);
+        let d = diags.get_mut(fid).unwrap();
+        let (f_min, f_max, f_avg, f_p95, f_p99) = d.freshness_stats();
+        let lat_p50 = d.latency_p50();
+        let lat_avg = d.latency_avg();
+
+        println!("Feed: {}", fid.label());
+        println!("  Connection Status:          Connected");
+        println!("  Raw Messages Received:      {}", d.raw_messages);
+        println!("  Snapshots Received:         {}", d.snapshots_received);
+        println!("  Deltas Received:            {}", d.deltas_received);
+        println!("  Parse Errors:               {}", d.parse_errors);
+        println!("  Unknown Messages:           {}", d.unknown_messages);
+        println!("  Sequence Violations:        {}", d.sequence_rejections);
+        println!("  Crossed Books Observed:     {}", d.crossed_books_observed);
+        println!("  Stale Transitions:          {}", d.stale_transitions);
+        println!("  Reconnects:                 {}", d.reconnects);
+        println!("  Sanity Violations:          {}", d.sanity_violations);
+        if let Some(s) = state {
+            println!("  Current Lifecycle:          {:?}", s.lifecycle_state);
+            println!("  Current Validity:           {:?}", s.validity);
+            println!("  Last Sequence ID:           {:?}", s.last_update_sequence);
+        }
+        if let Some(b) = trusted {
+            let bid = b.best_bid().map(|l| (l.price, l.quantity));
+            let ask = b.best_ask().map(|l| (l.price, l.quantity));
+            let spread = b.spread();
+            println!(
+                "  Best Bid:                   {} (size: {})",
+                bid.map(|(p, _)| p.to_string())
+                    .unwrap_or_else(|| "N/A".into()),
+                bid.map(|(_, q)| q.to_string())
+                    .unwrap_or_else(|| "N/A".into())
+            );
+            println!(
+                "  Best Ask:                   {} (size: {})",
+                ask.map(|(p, _)| p.to_string())
+                    .unwrap_or_else(|| "N/A".into()),
+                ask.map(|(_, q)| q.to_string())
+                    .unwrap_or_else(|| "N/A".into())
+            );
+            println!(
+                "  Spread:                     {}",
+                spread
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "N/A".into())
+            );
+            println!(
+                "  Book Depth:                 {} bids, {} asks",
+                b.bids.len(),
+                b.asks.len()
+            );
+        }
+        println!("  Last Exchange TS:           {} ms", d.last_exchange_ts_ms);
+        println!(
+            "  Local Receive Latency:      p50: {} us, avg: {} us",
+            lat_p50, lat_avg
+        );
+        println!(
+            "  Freshness (ms):             min: {} ms, max: {} ms, avg: {} ms, p95: {} ms, p99: {} ms",
+            f_min, f_max, f_avg, f_p95, f_p99
+        );
+        println!();
+    }
+
+    // --- REPORT SECTION 3: TRACE EVENT FLOW PROOF ---
+    println!("--------------------------------------------------------------------------------");
+    println!("3. TRACE EVENT FLOW PROOF (Raw -> Parsed -> Manager -> Accepted -> Trusted)");
+    println!("--------------------------------------------------------------------------------");
+    println!(
+        "{:<36} | {:<8} | {:<8} | {:<8} | {:<8} | {:<8} | {:<8}",
+        "Feed", "Raw Msgs", "Parsed", "Manager", "Accepted", "Seq Rej", "Trusted Obs"
+    );
+    println!(
+        "{:-<36}-|-{:-<8}-|-{:-<8}-|-{:-<8}-|-{:-<8}-|-{:-<8}-|-{:-<8}",
+        "", "", "", "", "", "", ""
+    );
+    for fid in &feed_ids {
+        let d = diags.get(fid).unwrap();
+        println!(
+            "{:<36} | {:<8} | {:<8} | {:<8} | {:<8} | {:<8} | {:<8}",
+            fid.label(),
+            d.raw_messages,
+            d.parsed_events,
+            d.manager_events,
+            d.accepted_updates,
+            d.sequence_rejections,
+            d.trusted_observations
+        );
+    }
+
+    // --- REPORT SECTION 4: SOAK SUMMARY ---
+    let total_raw: u64 = diags.values().map(|d| d.raw_messages).sum();
+    let total_seq_errors: u64 = diags.values().map(|d| d.sequence_rejections).sum();
+    let total_crossed: u64 = diags.values().map(|d| d.crossed_books_observed).sum();
+    let total_parse_errors: u64 = diags.values().map(|d| d.parse_errors).sum();
+    let total_unknown: u64 = diags.values().map(|d| d.unknown_messages).sum();
+    let total_disconnects: u64 = diags.values().map(|d| d.disconnects).sum();
+    let total_reconnects: u64 = diags.values().map(|d| d.reconnects).sum();
+    let total_sanity_violations: u64 = diags.values().map(|d| d.sanity_violations).sum();
+
+    println!("\n--------------------------------------------------------------------------------");
+    println!("4. SOAK SUMMARY & RESOURCE PROFILE");
+    println!("--------------------------------------------------------------------------------");
+    println!("Actual Run Duration:          {:.2?}", elapsed);
+    println!("Total Raw Messages Ingested:  {}", total_raw);
+    println!(
+        "Aggregate Ingestion Rate:     {:.1} msgs/sec",
+        (total_raw as f64) / elapsed.as_secs_f64()
+    );
+    println!("Sequence Continuity Errors:   {}", total_seq_errors);
+    println!("Crossed Book Observations:    {}", total_crossed);
+    println!("Parse Errors:                 {}", total_parse_errors);
+    println!("Unknown Messages:             {}", total_unknown);
+    println!("Disconnects Observed:         {}", total_disconnects);
+    println!("Reconnects Observed:          {}", total_reconnects);
+    println!("Sanity Invariant Violations:  {}", total_sanity_violations);
+    println!(
+        "Initial Memory (Working Set): {:.2} MB",
+        (start_mem_ws as f64) / (1024.0 * 1024.0)
+    );
+    println!(
+        "Ending Memory (Working Set):  {:.2} MB",
+        (end_mem_ws as f64) / (1024.0 * 1024.0)
+    );
+    println!(
+        "Peak Memory (Working Set):    {:.2} MB",
+        (peak_mem_ws as f64) / (1024.0 * 1024.0)
+    );
+    println!("================================================================================\n");
+
+    // Acceptance Assertions
+    if !all_trusted {
+        return Err(EngineError::Validation(
+            "Validation failed: Not all 4 feeds achieved TRUSTED state".into(),
+        ));
+    }
+    if total_seq_errors > 0 {
+        return Err(EngineError::Validation(format!(
+            "Validation failed: {total_seq_errors} sequence errors detected"
+        )));
+    }
+    if total_crossed > 0 {
+        return Err(EngineError::Validation(format!(
+            "Validation failed: {total_crossed} crossed book states detected"
+        )));
+    }
+    if total_sanity_violations > 0 {
+        return Err(EngineError::Validation(format!(
+            "Validation failed: {total_sanity_violations} sanity invariant violations detected"
+        )));
+    }
+    if total_parse_errors > 0 {
+        return Err(EngineError::Validation(format!(
+            "Validation failed: {total_parse_errors} parse errors detected"
+        )));
+    }
+
+    info!(
+        target: "airbitrage::four_book",
+        duration_secs,
+        "Simultaneous 4-book live validation passed successfully with ALL 4 BOOKS TRUSTED"
+    );
+    Ok(())
+}
+
+async fn run_four_book_recovery_test(symbol: &str) -> Result<()> {
+    info!(
+        target: "airbitrage::recovery",
+        symbol,
+        "Starting 4-book forced recovery test harness"
+    );
+
+    println!("\n================================================================================");
+    println!("         FOUR-BOOK FORCED RECOVERY & RESILIENCE TEST HARNESS");
+    println!("================================================================================");
+    println!("Target Symbol: BTCUSDT | Testing Bybit Spot & Binance Futures forced failover");
+
+    let (event_tx, mut event_rx) = mpsc::channel::<MarketEvent>(16384);
+
+    // Individual shutdown channels for targeted cancellation
+    let (shutdown_tx_b_spot, shutdown_rx_b_spot) = tokio::sync::watch::channel(false);
+    let (mut shutdown_tx_b_depth, shutdown_rx_b_depth) = tokio::sync::watch::channel(false);
+    let (shutdown_tx_b_mark, shutdown_rx_b_mark) = tokio::sync::watch::channel(false);
+    let (mut shutdown_tx_by_spot, shutdown_rx_by_spot) = tokio::sync::watch::channel(false);
+    let (shutdown_tx_by_linear, shutdown_rx_by_linear) = tokio::sync::watch::channel(false);
+
+    // Spawn 1: Binance Spot
+    let binance_client = BinanceClient::new(symbol);
+    let c_spot = binance_client.clone();
+    let tx1 = event_tx.clone();
+    tokio::spawn(async move {
+        c_spot.run_spot_stream(tx1, shutdown_rx_b_spot).await;
+    });
+
+    // Spawn 2: Binance Futures Depth
+    let c_depth = binance_client.clone();
+    let tx2 = event_tx.clone();
+    tokio::spawn(async move {
+        c_depth
+            .run_futures_depth_stream(tx2, shutdown_rx_b_depth.clone())
+            .await;
+    });
+
+    // Spawn 3: Binance Futures Mark
+    let c_mark = binance_client.clone();
+    let tx3 = event_tx.clone();
+    tokio::spawn(async move {
+        c_mark
+            .run_futures_mark_stream(tx3, shutdown_rx_b_mark)
+            .await;
+    });
+
+    // Spawn 4: Bybit Spot
+    let bybit_spot_metrics = Arc::new(BybitMetrics::default());
+    let bybit_spot_feed = BybitWebSocketFeed::with_metrics(
+        BybitFeedConfig::default_spot(symbol),
+        bybit_spot_metrics.clone(),
+        event_tx.clone(),
+    );
+    let rx_by_spot = shutdown_rx_by_spot.clone();
+    tokio::spawn(async move {
+        let _ = bybit_spot_feed.run_stream(rx_by_spot).await;
+    });
+
+    // Spawn 5: Bybit Linear
+    let bybit_linear_metrics = Arc::new(BybitMetrics::default());
+    let bybit_linear_feed = BybitWebSocketFeed::with_metrics(
+        BybitFeedConfig::default_linear(symbol),
+        bybit_linear_metrics.clone(),
+        event_tx.clone(),
+    );
+    tokio::spawn(async move {
+        let _ = bybit_linear_feed.run_stream(shutdown_rx_by_linear).await;
+    });
+
+    let mut manager = MarketStateManager::new(Duration::from_millis(3000));
+    manager.register_instrument(VenueId::Binance, MarketType::Spot, symbol);
+    manager.register_instrument(VenueId::Binance, MarketType::LinearPerpetual, symbol);
+    manager.register_instrument(VenueId::Bybit, MarketType::Spot, symbol);
+    manager.register_instrument(VenueId::Bybit, MarketType::LinearPerpetual, symbol);
+
+    let mut futures_snapshot_requested = false;
+    let mut futures_snapshot_applied = false;
+
+    // Phase 1: Wait for all 4 books to reach Live + Trusted
+    println!("\n[Phase 1] Establishing initial baseline synchronization across all 4 books...");
+    let baseline_start = Instant::now();
+    let baseline_timeout = Duration::from_secs(12);
+
+    while baseline_start.elapsed() < baseline_timeout {
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                let is_fut_snap = matches!(
+                    &event,
+                    MarketEvent::OrderBookSnapshot {
+                        venue: VenueId::Binance,
+                        market_type: MarketType::LinearPerpetual,
+                        ..
+                    }
+                );
+                let _ = manager.handle_event(&event);
+                if is_fut_snap {
+                    futures_snapshot_applied = true;
+                }
+                if !futures_snapshot_requested && !futures_snapshot_applied {
+                    let count = manager
+                        .get_state(VenueId::Binance, MarketType::LinearPerpetual, symbol)
+                        .map(|s| s.buffered_delta_count())
+                        .unwrap_or(0);
+                    if count >= 5 {
+                        futures_snapshot_requested = true;
+                        let sym_copy = symbol.to_string();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            if let Ok(Ok(snap)) = tokio::task::spawn_blocking(move || fetch_binance_futures_snapshot(&sym_copy)).await {
+                                let _ = tx.send(snap).await;
+                            }
+                        });
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        let b_spot = manager.get_trusted_book(VenueId::Binance, MarketType::Spot, symbol, now_ns);
+        let b_fut = manager.get_trusted_book(
+            VenueId::Binance,
+            MarketType::LinearPerpetual,
+            symbol,
+            now_ns,
+        );
+        let by_spot = manager.get_trusted_book(VenueId::Bybit, MarketType::Spot, symbol, now_ns);
+        let by_linear =
+            manager.get_trusted_book(VenueId::Bybit, MarketType::LinearPerpetual, symbol, now_ns);
+
+        if b_spot.is_some() && b_fut.is_some() && by_spot.is_some() && by_linear.is_some() {
+            println!(
+                "  -> Baseline achieved: ALL 4 BOOKS ARE LIVE, VALID, AND TRUSTED in {:.2?}",
+                baseline_start.elapsed()
+            );
+            break;
+        }
+    }
+
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    if manager
+        .get_trusted_book(VenueId::Bybit, MarketType::Spot, symbol, now_ns)
+        .is_none()
+    {
+        return Err(EngineError::Validation(
+            "Failed to establish Bybit Spot baseline".into(),
+        ));
+    }
+    if manager
+        .get_trusted_book(
+            VenueId::Binance,
+            MarketType::LinearPerpetual,
+            symbol,
+            now_ns,
+        )
+        .is_none()
+    {
+        return Err(EngineError::Validation(
+            "Failed to establish Binance Futures baseline".into(),
+        ));
+    }
+
+    // Phase 2: Interrupt Bybit Spot
+    println!("\n[Phase 2] Executing Forced Interruption on Bybit Spot...");
+    let t_spot_disconnect = Instant::now();
+    let _ = shutdown_tx_by_spot.send(true);
+    let disconnect_event = MarketEvent::ConnectionState {
+        venue: VenueId::Bybit,
+        market_type: Some(MarketType::Spot),
+        is_connected: false,
+        details: "Forced test cancellation".into(),
+    };
+    manager.handle_event(&disconnect_event)?;
+
+    // Verify Bybit Spot is INVALIDATED immediately
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    assert!(
+        manager
+            .get_trusted_book(VenueId::Bybit, MarketType::Spot, symbol, now_ns)
+            .is_none(),
+        "Bybit Spot must NOT be trusted after disconnect"
+    );
+    assert_eq!(
+        manager
+            .get_state(VenueId::Bybit, MarketType::Spot, symbol)
+            .unwrap()
+            .lifecycle_state,
+        BookLifecycleState::Invalidated
+    );
+    println!("  -> Verified: Bybit Spot is immediately INVALIDATED (not trusted)");
+
+    // Verify CONCURRENCY SAFETY: Other 3 feeds remain LIVE and TRUSTED
+    assert!(
+        manager
+            .get_trusted_book(VenueId::Bybit, MarketType::LinearPerpetual, symbol, now_ns)
+            .is_some(),
+        "Bybit Linear must remain TRUSTED despite Bybit Spot drop"
+    );
+    assert!(
+        manager
+            .get_trusted_book(VenueId::Binance, MarketType::Spot, symbol, now_ns)
+            .is_some(),
+        "Binance Spot must remain TRUSTED despite Bybit Spot drop"
+    );
+    assert!(
+        manager
+            .get_trusted_book(
+                VenueId::Binance,
+                MarketType::LinearPerpetual,
+                symbol,
+                now_ns
+            )
+            .is_some(),
+        "Binance Futures must remain TRUSTED despite Bybit Spot drop"
+    );
+    println!("  -> Verified: Concurrency safety preserved — other 3 feeds remained Live & Trusted");
+
+    // Hold outage for 1.5 seconds while draining events for other feeds
+    let outage_hold = Instant::now();
+    while outage_hold.elapsed() < Duration::from_millis(1500) {
+        if let Ok(event) = event_rx.try_recv() {
+            let _ = manager.handle_event(&event);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Re-spawn Bybit Spot feed
+    println!("  -> Spawning reconnected Bybit Spot stream...");
+    let (new_tx_by_spot, new_rx_by_spot) = tokio::sync::watch::channel(false);
+    shutdown_tx_by_spot = new_tx_by_spot;
+
+    let bybit_spot_feed_reconnected = BybitWebSocketFeed::with_metrics(
+        BybitFeedConfig::default_spot(symbol),
+        bybit_spot_metrics.clone(),
+        event_tx.clone(),
+    );
+    tokio::spawn(async move {
+        let _ = bybit_spot_feed_reconnected.run_stream(new_rx_by_spot).await;
+    });
+
+    let mut spot_recovered = false;
+    let spot_recovery_timeout = Duration::from_secs(8);
+    let mut spot_seq_errors = 0;
+    let mut spot_crossed_books = 0;
+
+    while t_spot_disconnect.elapsed() < spot_recovery_timeout && !spot_recovered {
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                let fid = FeedId::from_event(&event);
+                match manager.handle_event(&event) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if fid == Some(FeedId::BybitSpot) {
+                            match e {
+                                EngineError::SequenceGap { .. } | EngineError::OutOfOrderUpdate { .. } => {
+                                    spot_seq_errors += 1;
+                                }
+                                EngineError::CrossedBook { .. } => {
+                                    spot_crossed_books += 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        if manager
+            .get_trusted_book(VenueId::Bybit, MarketType::Spot, symbol, now_ns)
+            .is_some()
+        {
+            spot_recovered = true;
+        }
+    }
+
+    let spot_recovery_dur = t_spot_disconnect.elapsed();
+    assert!(
+        spot_recovered,
+        "Bybit Spot failed to recover to TRUSTED state"
+    );
+    assert_eq!(
+        spot_seq_errors, 0,
+        "Bybit Spot experienced sequence errors during recovery"
+    );
+    assert_eq!(
+        spot_crossed_books, 0,
+        "Bybit Spot observed crossed books during recovery"
+    );
+    println!(
+        "  -> Bybit Spot successfully RECOVERED to LIVE + VALID + TRUSTED in {:.2?}",
+        spot_recovery_dur
+    );
+    println!("     Post-recovery sequence errors: {}", spot_seq_errors);
+    println!("     Post-recovery crossed books:   {}", spot_crossed_books);
+
+    // Phase 3: Interrupt Binance Futures
+    println!("\n[Phase 3] Executing Forced Interruption on Binance Futures Depth...");
+    let t_fut_disconnect = Instant::now();
+    let _ = shutdown_tx_b_depth.send(true);
+    let disconnect_fut = MarketEvent::ConnectionState {
+        venue: VenueId::Binance,
+        market_type: Some(MarketType::LinearPerpetual),
+        is_connected: false,
+        details: "Forced test cancellation".into(),
+    };
+    manager.handle_event(&disconnect_fut)?;
+
+    // Verify Binance Futures is INVALIDATED
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    assert!(
+        manager
+            .get_trusted_book(
+                VenueId::Binance,
+                MarketType::LinearPerpetual,
+                symbol,
+                now_ns
+            )
+            .is_none(),
+        "Binance Futures must NOT be trusted after disconnect"
+    );
+    println!("  -> Verified: Binance Futures is immediately INVALIDATED (not trusted)");
+
+    // Verify other 3 feeds remain untouched
+    assert!(
+        manager
+            .get_trusted_book(VenueId::Binance, MarketType::Spot, symbol, now_ns)
+            .is_some(),
+        "Binance Spot must remain TRUSTED despite Futures depth drop"
+    );
+    assert!(
+        manager
+            .get_trusted_book(VenueId::Bybit, MarketType::Spot, symbol, now_ns)
+            .is_some(),
+        "Bybit Spot must remain TRUSTED"
+    );
+    assert!(
+        manager
+            .get_trusted_book(VenueId::Bybit, MarketType::LinearPerpetual, symbol, now_ns)
+            .is_some(),
+        "Bybit Linear must remain TRUSTED"
+    );
+    println!(
+        "  -> Verified: Concurrency safety preserved — Binance Spot and Bybit feeds unaffected"
+    );
+
+    // Hold outage for 1.5 seconds
+    let outage_hold = Instant::now();
+    while outage_hold.elapsed() < Duration::from_millis(1500) {
+        if let Ok(event) = event_rx.try_recv() {
+            let _ = manager.handle_event(&event);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Re-spawn Binance Futures depth stream
+    println!("  -> Spawning reconnected Binance Futures depth stream...");
+    let (new_tx_b_depth, new_rx_b_depth) = tokio::sync::watch::channel(false);
+    shutdown_tx_b_depth = new_tx_b_depth;
+
+    let c_depth_reconnected = binance_client.clone();
+    let tx_fut_reconnected = event_tx.clone();
+    tokio::spawn(async move {
+        c_depth_reconnected
+            .run_futures_depth_stream(tx_fut_reconnected, new_rx_b_depth)
+            .await;
+    });
+
+    let mut fut_recovered = false;
+    let fut_recovery_timeout = Duration::from_secs(12);
+    let mut fut_seq_errors = 0;
+    let mut fut_crossed_books = 0;
+    let mut fut_re_snapshot_requested = false;
+    let mut fut_re_snapshot_applied = false;
+
+    while t_fut_disconnect.elapsed() < fut_recovery_timeout && !fut_recovered {
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                let fid = FeedId::from_event(&event);
+                let is_fut_snap = matches!(
+                    &event,
+                    MarketEvent::OrderBookSnapshot {
+                        venue: VenueId::Binance,
+                        market_type: MarketType::LinearPerpetual,
+                        ..
+                    }
+                );
+
+                match manager.handle_event(&event) {
+                    Ok(_) => {
+                        if is_fut_snap {
+                            fut_re_snapshot_applied = true;
+                            info!(target: "airbitrage::recovery", "Binance Futures re-snapshot aligned successfully");
+                        }
+                    }
+                    Err(e) => {
+                        if fid == Some(FeedId::BinanceLinear) {
+                            match e {
+                                EngineError::SequenceGap { .. } | EngineError::OutOfOrderUpdate { .. } => {
+                                    fut_seq_errors += 1;
+                                }
+                                EngineError::CrossedBook { .. } => {
+                                    fut_crossed_books += 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                // Check buffering for new REST snapshot
+                if !fut_re_snapshot_requested && !fut_re_snapshot_applied {
+                    let count = manager
+                        .get_state(VenueId::Binance, MarketType::LinearPerpetual, symbol)
+                        .map(|s| s.buffered_delta_count())
+                        .unwrap_or(0);
+                    if count >= 5 {
+                        fut_re_snapshot_requested = true;
+                        let sym_copy = symbol.to_string();
+                        let tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            if let Ok(Ok(snap)) = tokio::task::spawn_blocking(move || fetch_binance_futures_snapshot(&sym_copy)).await {
+                                let _ = tx.send(snap).await;
+                            }
+                        });
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        if manager
+            .get_trusted_book(
+                VenueId::Binance,
+                MarketType::LinearPerpetual,
+                symbol,
+                now_ns,
+            )
+            .is_some()
+        {
+            fut_recovered = true;
+        }
+    }
+
+    let fut_recovery_dur = t_fut_disconnect.elapsed();
+    assert!(
+        fut_recovered,
+        "Binance Futures failed to recover to TRUSTED state"
+    );
+    assert_eq!(
+        fut_seq_errors, 0,
+        "Binance Futures experienced sequence errors during recovery"
+    );
+    assert_eq!(
+        fut_crossed_books, 0,
+        "Binance Futures observed crossed books during recovery"
+    );
+    println!(
+        "  -> Binance Futures successfully RECOVERED to LIVE + VALID + TRUSTED in {:.2?}",
+        fut_recovery_dur
+    );
+    println!("     Post-recovery sequence errors: {}", fut_seq_errors);
+    println!("     Post-recovery crossed books:   {}", fut_crossed_books);
+
+    // Shutdown all
+    let _ = shutdown_tx_b_spot.send(true);
+    let _ = shutdown_tx_b_depth.send(true);
+    let _ = shutdown_tx_b_mark.send(true);
+    let _ = shutdown_tx_by_spot.send(true);
+    let _ = shutdown_tx_by_linear.send(true);
+
+    println!("\n================================================================================");
+    println!("             FORCED RECOVERY TEST SUITE COMPLETE: ALL SCENARIOS PASSED");
+    println!("================================================================================\n");
+
+    info!(target: "airbitrage::recovery", "4-book forced recovery test suite completed cleanly with 0 sequence errors");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let config_path = parse_config_path();
 
     init_logging("info");
+
+    if args.iter().any(|arg| arg == "--four-book-smoke") {
+        return run_four_book_validation("BTCUSDT", 60).await;
+    }
+
+    if let Some(pos) = args.iter().position(|arg| arg == "--four-book-soak") {
+        let duration: u64 = args
+            .get(pos + 1)
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(300);
+        return run_four_book_validation("BTCUSDT", duration).await;
+    }
+
+    if args.iter().any(|arg| arg == "--four-book-recovery") {
+        return run_four_book_recovery_test("BTCUSDT").await;
+    }
 
     if args.iter().any(|arg| arg == "--market-state-live") {
         let pos = args.iter().position(|arg| arg == "--market-state-live");

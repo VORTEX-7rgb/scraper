@@ -514,6 +514,7 @@ impl MarketState {
                             current_u = delta.sequence_id;
                             self.metrics.deltas_applied += 1;
                         }
+                        self.awaiting_initial_covering = false;
                     } else if !self.delta_buffer.is_empty() {
                         // Remaining deltas have a sequence gap beyond the snapshot
                         let (first_seq, final_seq, prev_seq) = {
@@ -539,12 +540,15 @@ impl MarketState {
                             first_seq,
                             final_seq,
                         });
+                    } else {
+                        // All buffered events were older than the snapshot and were dropped.
+                        // The initial covering update will arrive via the live stream.
+                        self.awaiting_initial_covering = true;
                     }
 
                     self.last_update_sequence = Some(current_u);
                 }
             }
-            self.awaiting_initial_covering = false;
         } else {
             self.last_update_sequence = Some(sequence_id);
             self.awaiting_initial_covering =

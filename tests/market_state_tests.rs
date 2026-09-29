@@ -665,6 +665,7 @@ fn test_manager_disconnection_invalidates_books() {
     // Venue drops
     let disconnect = MarketEvent::ConnectionState {
         venue: VenueId::Binance,
+        market_type: None,
         is_connected: false,
         details: "TCP reset".into(),
     };
@@ -1206,4 +1207,123 @@ fn test_m2_1_crossed_book_remains_invalid() {
     assert_eq!(state.lifecycle_state, BookLifecycleState::Invalidated);
     assert!(!state.validity.is_valid());
     assert!(state.trusted_book(None, 1010).is_none());
+}
+
+#[test]
+fn test_scoped_disconnection_isolation() {
+    let mut manager = MarketStateManager::new(Duration::from_millis(5000));
+    manager.register_instrument(VenueId::Binance, MarketType::Spot, "BTCUSDT");
+    manager.register_instrument(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT");
+    manager.register_instrument(VenueId::Bybit, MarketType::Spot, "BTCUSDT");
+    manager.register_instrument(VenueId::Bybit, MarketType::LinearPerpetual, "BTCUSDT");
+
+    // Initialize all 4 to live with snapshots
+    for (venue, market_type) in [
+        (VenueId::Binance, MarketType::Spot),
+        (VenueId::Binance, MarketType::LinearPerpetual),
+        (VenueId::Bybit, MarketType::Spot),
+        (VenueId::Bybit, MarketType::LinearPerpetual),
+    ] {
+        let snap = MarketEvent::OrderBookSnapshot {
+            venue,
+            market_type,
+            symbol: "BTCUSDT".into(),
+            bids: vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+            asks: vec![PriceLevel::new(dec!(65010.00), dec!(1.0))],
+            exchange_ts_ms: 1000,
+            local_recv_ts_ns: 1000,
+            sequence_id: 100,
+        };
+        manager.handle_event(&snap).unwrap();
+        assert!(manager.is_live(venue, market_type, "BTCUSDT"));
+    }
+
+    // Now disconnect ONLY Bybit Spot
+    let disconnect_bybit_spot = MarketEvent::ConnectionState {
+        venue: VenueId::Bybit,
+        market_type: Some(MarketType::Spot),
+        is_connected: false,
+        details: "Bybit Spot dropped".into(),
+    };
+    manager.handle_event(&disconnect_bybit_spot).unwrap();
+
+    // Verify: Bybit Spot is INVALIDATED
+    assert!(!manager.is_live(VenueId::Bybit, MarketType::Spot, "BTCUSDT"));
+    assert_eq!(
+        manager
+            .get_state(VenueId::Bybit, MarketType::Spot, "BTCUSDT")
+            .unwrap()
+            .lifecycle_state,
+        BookLifecycleState::Invalidated
+    );
+
+    // Verify: Bybit Linear, Binance Spot, and Binance Futures REMAIN LIVE
+    assert!(manager.is_live(VenueId::Bybit, MarketType::LinearPerpetual, "BTCUSDT"));
+    assert!(manager.is_live(VenueId::Binance, MarketType::Spot, "BTCUSDT"));
+    assert!(manager.is_live(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT"));
+}
+
+#[test]
+fn test_binance_futures_snapshot_with_obsolete_buffered_deltas_awaits_live_covering() {
+    let mut state = MarketState::new(VenueId::Binance, MarketType::LinearPerpetual, "BTCUSDT");
+
+    // Buffer deltas while awaiting snapshot (all with u < 1000)
+    let d1 = make_delta(
+        vec![PriceLevel::new(dec!(65000.00), dec!(1.0))],
+        vec![],
+        900,
+        910,
+        Some(890),
+        1000,
+    );
+    let d2 = make_delta(
+        vec![PriceLevel::new(dec!(65001.00), dec!(1.0))],
+        vec![],
+        911,
+        920,
+        Some(910),
+        1010,
+    );
+    state.apply_delta(d1).unwrap();
+    state.apply_delta(d2).unwrap();
+    assert_eq!(state.buffered_delta_count(), 2);
+
+    // REST snapshot arrives at sequence 1000
+    let bids = vec![PriceLevel::new(dec!(65000.00), dec!(2.0))];
+    let asks = vec![PriceLevel::new(dec!(65010.00), dec!(2.0))];
+    let applied = state
+        .apply_snapshot(bids, asks, 1020, 1020, 1000)
+        .expect("Snapshot should be applied");
+    assert!(applied);
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Live);
+    assert_eq!(state.last_update_sequence, Some(1000));
+    assert_eq!(state.buffered_delta_count(), 0);
+
+    // Live stream delivers the covering delta (U <= 1000 <= u, pu < 1000)
+    let covering_delta = make_delta(
+        vec![PriceLevel::new(dec!(65002.00), dec!(1.5))],
+        vec![],
+        980,
+        1050,
+        Some(975),
+        1030,
+    );
+    let res = state.apply_delta(covering_delta);
+    assert!(res.is_ok(), "Covering delta should be accepted: {:?}", res);
+    assert_eq!(state.last_update_sequence, Some(1050));
+
+    // Next live delta with strict pu = 1050
+    let next_delta = make_delta(
+        vec![],
+        vec![PriceLevel::new(dec!(65008.00), dec!(1.0))],
+        1051,
+        1060,
+        Some(1050),
+        1040,
+    );
+    assert!(state.apply_delta(next_delta).is_ok());
+    assert_eq!(state.last_update_sequence, Some(1060));
+    assert_eq!(state.lifecycle_state, BookLifecycleState::Live);
+    assert!(state.validity.is_valid());
+    assert!(state.trusted_book(None, 1040).is_some());
 }

@@ -1,9 +1,11 @@
 use crate::error::{EngineError, Result};
+use crate::execution::{CrossBookComparison, ExecutionEstimate, FeeSchedule};
 use crate::market::OrderBook;
 use crate::market::state::{
-    DeltaUpdate, InvalidationReason, MarketState, MarketStateMetrics, SequencePolicy,
+    BookLifecycleState, DeltaUpdate, InvalidationReason, MarketState, MarketStateMetrics,
+    SequencePolicy,
 };
-use crate::types::{MarketEvent, MarketType, PriceLevel, VenueId};
+use crate::types::{MarketEvent, MarketType, PriceLevel, Side, VenueId};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -176,15 +178,32 @@ impl MarketStateManager {
             }
             MarketEvent::ConnectionState {
                 venue,
+                market_type,
                 is_connected,
                 details,
             } => {
                 if !*is_connected {
-                    // When a venue drops, immediately invalidate all books for that venue
+                    // When a feed drops, invalidate books matching venue (and market_type if specified)
                     for (key, state) in self.books.iter_mut() {
-                        if key.venue == *venue {
+                        let matches_venue = key.venue == *venue;
+                        let matches_market =
+                            market_type.is_none() || market_type.as_ref() == Some(&key.market_type);
+                        if matches_venue && matches_market {
                             state
                                 .invalidate(InvalidationReason::VenueDisconnected(details.clone()));
+                        }
+                    }
+                } else {
+                    // When a feed reconnects, transition invalidated books to AwaitingSnapshot so they can buffer deltas & accept snapshot
+                    for (key, state) in self.books.iter_mut() {
+                        let matches_venue = key.venue == *venue;
+                        let matches_market =
+                            market_type.is_none() || market_type.as_ref() == Some(&key.market_type);
+                        if matches_venue
+                            && matches_market
+                            && state.lifecycle_state == BookLifecycleState::Invalidated
+                        {
+                            let _ = state.request_resync();
                         }
                     }
                 }
@@ -227,6 +246,61 @@ impl MarketStateManager {
     ) -> Option<&OrderBook> {
         let state = self.get_state(venue, market_type, symbol)?;
         state.trusted_book(Some(self.max_staleness), now_ns)
+    }
+
+    /// Estimate visible depth execution for an instrument, ONLY if the book is currently trusted.
+    ///
+    /// Returns `None` if the order book is untrusted (invalidated, resyncing, stale, crossed, etc.).
+    /// Returns `Err` if the requested quantity is non-positive (`<= 0`).
+    pub fn estimate_execution(
+        &self,
+        venue: VenueId,
+        market_type: MarketType,
+        symbol: &str,
+        side: Side,
+        quantity: Decimal,
+        now_ns: i64,
+    ) -> Result<Option<ExecutionEstimate>> {
+        let Some(book) = self.get_trusted_book(venue, market_type, symbol, now_ns) else {
+            return Ok(None);
+        };
+        crate::execution::walk_depth(book, side, quantity).map(Some)
+    }
+
+    /// Compare cross-book executable pricing between two trusted instruments for the SAME requested quantity.
+    ///
+    /// Buy on `buy_venue`, Sell on `sell_venue`.
+    /// Returns `None` if EITHER order book is untrusted.
+    /// Returns `Err` if requested quantity is non-positive (`<= 0`) or cost rates are negative.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compare_executable_books(
+        &self,
+        buy_venue: VenueId,
+        buy_market: MarketType,
+        sell_venue: VenueId,
+        sell_market: MarketType,
+        symbol: &str,
+        quantity: Decimal,
+        buy_fee_schedule: &FeeSchedule,
+        sell_fee_schedule: &FeeSchedule,
+        other_cost_rate: Decimal,
+        now_ns: i64,
+    ) -> Result<Option<CrossBookComparison>> {
+        let Some(buy_book) = self.get_trusted_book(buy_venue, buy_market, symbol, now_ns) else {
+            return Ok(None);
+        };
+        let Some(sell_book) = self.get_trusted_book(sell_venue, sell_market, symbol, now_ns) else {
+            return Ok(None);
+        };
+        crate::execution::compare_cross_book(
+            buy_book,
+            sell_book,
+            quantity,
+            buy_fee_schedule,
+            sell_fee_schedule,
+            other_cost_rate,
+        )
+        .map(Some)
     }
 
     /// Check if a given instrument's state is currently Live and Valid.

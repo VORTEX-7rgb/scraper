@@ -1,6 +1,8 @@
 pub mod config;
 pub mod error;
+pub mod execution;
 pub mod market;
+pub mod observatory;
 pub mod types;
 pub mod venues;
 

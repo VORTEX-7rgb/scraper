@@ -1,5 +1,6 @@
 use crate::error::{EngineError, Result};
 use crate::types::{MarketType, VenueId};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,8 @@ pub struct AppConfig {
     pub storage: StorageSettings,
     pub engine: EngineSettings,
     pub venues: Vec<VenueSettings>,
+    #[serde(default)]
+    pub observatory: ObservatorySettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +41,52 @@ pub struct VenueSettings {
     pub enabled: bool,
     pub symbols: Vec<String>,
     pub market_types: Vec<MarketType>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservatorySettings {
+    #[serde(default = "default_reference_quantities")]
+    pub reference_quantities: Vec<Decimal>,
+    #[serde(default = "default_max_book_age_ms")]
+    pub max_book_age_ms: u64,
+    #[serde(default = "default_max_timestamp_skew_ms")]
+    pub max_timestamp_skew_ms: u64,
+    #[serde(default = "default_min_net_edge_bps")]
+    pub min_net_edge_bps: Decimal,
+}
+
+fn default_reference_quantities() -> Vec<Decimal> {
+    vec![
+        Decimal::new(1, 3),  // 0.001
+        Decimal::new(5, 3),  // 0.005
+        Decimal::new(1, 2),  // 0.01
+        Decimal::new(25, 3), // 0.025
+        Decimal::new(5, 2),  // 0.05
+        Decimal::new(1, 1),  // 0.10
+    ]
+}
+
+fn default_max_book_age_ms() -> u64 {
+    1_000
+}
+
+fn default_max_timestamp_skew_ms() -> u64 {
+    2_000
+}
+
+fn default_min_net_edge_bps() -> Decimal {
+    Decimal::ZERO
+}
+
+impl Default for ObservatorySettings {
+    fn default() -> Self {
+        Self {
+            reference_quantities: default_reference_quantities(),
+            max_book_age_ms: default_max_book_age_ms(),
+            max_timestamp_skew_ms: default_max_timestamp_skew_ms(),
+            min_net_edge_bps: default_min_net_edge_bps(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -88,6 +137,32 @@ impl AppConfig {
                     venue.id
                 )));
             }
+        }
+
+        if self.observatory.reference_quantities.is_empty() {
+            return Err(EngineError::Config(
+                "observatory.reference_quantities cannot be empty".into(),
+            ));
+        }
+
+        for &qty in &self.observatory.reference_quantities {
+            if qty <= Decimal::ZERO {
+                return Err(EngineError::Config(format!(
+                    "Invalid reference quantity {qty}: must be strictly positive"
+                )));
+            }
+        }
+
+        if self.observatory.max_book_age_ms == 0 {
+            return Err(EngineError::Config(
+                "observatory.max_book_age_ms must be greater than zero".into(),
+            ));
+        }
+
+        if self.observatory.max_timestamp_skew_ms == 0 {
+            return Err(EngineError::Config(
+                "observatory.max_timestamp_skew_ms must be greater than zero".into(),
+            ));
         }
 
         Ok(())

@@ -223,6 +223,13 @@ pub fn parse_bybit_message(raw_text: &str) -> Result<BybitParsedMessage> {
                     conn_id: envelope.conn_id,
                 });
             }
+            "ping" if envelope.ret_msg.as_deref() == Some("pong") => {
+                let args = envelope.args.unwrap_or_default();
+                return Ok(BybitParsedMessage::Pong {
+                    args,
+                    conn_id: envelope.conn_id,
+                });
+            }
             _ => {}
         }
     }
@@ -455,6 +462,7 @@ impl BybitWebSocketFeed {
                 .event_tx
                 .send(MarketEvent::ConnectionState {
                     venue: VenueId::Bybit,
+                    market_type: Some(self.config.market_type),
                     is_connected: false,
                     details: "Connecting".into(),
                 })
@@ -477,6 +485,7 @@ impl BybitWebSocketFeed {
                         .event_tx
                         .send(MarketEvent::ConnectionState {
                             venue: VenueId::Bybit,
+                            market_type: Some(self.config.market_type),
                             is_connected: true,
                             details: "Connected".into(),
                         })
@@ -516,6 +525,7 @@ impl BybitWebSocketFeed {
                 .event_tx
                 .send(MarketEvent::ConnectionState {
                     venue: VenueId::Bybit,
+                    market_type: Some(self.config.market_type),
                     is_connected: false,
                     details: format!("Reconnecting in {:?}", backoff),
                 })
@@ -637,7 +647,7 @@ impl BybitWebSocketFeed {
                                         }
                                         BybitParsedMessage::Unknown(raw) => {
                                             self.metrics.unknown_messages.fetch_add(1, Ordering::Relaxed);
-                                            debug!(raw = %raw, "Received unhandled Bybit message");
+                                            info!(raw = %raw, "Received unhandled Bybit message");
                                         }
                                     }
                                 }

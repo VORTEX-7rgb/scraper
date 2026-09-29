@@ -603,6 +603,7 @@ impl BinanceClient {
 
                     let _ = event_tx.try_send(MarketEvent::ConnectionState {
                         venue: VenueId::Binance,
+                        market_type: Some(MarketType::Spot),
                         is_connected: true,
                         details: "Connected to Spot WS".into(),
                     });
@@ -698,6 +699,7 @@ impl BinanceClient {
                     self.freshness.reset(BinanceStreamType::SpotDepth);
                     let _ = event_tx.try_send(MarketEvent::ConnectionState {
                         venue: VenueId::Binance,
+                        market_type: Some(MarketType::Spot),
                         is_connected: false,
                         details: "Disconnected from Spot WS".into(),
                     });
@@ -730,7 +732,7 @@ impl BinanceClient {
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         let symbol_lower = self.symbol.to_lowercase();
-        let depth_param = format!("{}@depth20@100ms", symbol_lower);
+        let depth_param = format!("{}@depth@100ms", symbol_lower);
         let sub_payload = serde_json::json!({
             "method": "SUBSCRIBE",
             "params": [depth_param],
@@ -765,6 +767,7 @@ impl BinanceClient {
 
                     let _ = event_tx.try_send(MarketEvent::ConnectionState {
                         venue: VenueId::Binance,
+                        market_type: Some(MarketType::LinearPerpetual),
                         is_connected: true,
                         details: "Connected to Futures /public WS".into(),
                     });
@@ -858,6 +861,7 @@ impl BinanceClient {
                     self.freshness.reset(BinanceStreamType::FuturesDepth);
                     let _ = event_tx.try_send(MarketEvent::ConnectionState {
                         venue: VenueId::Binance,
+                        market_type: Some(MarketType::LinearPerpetual),
                         is_connected: false,
                         details: "Disconnected from Futures /public WS".into(),
                     });
@@ -925,6 +929,7 @@ impl BinanceClient {
 
                     let _ = event_tx.try_send(MarketEvent::ConnectionState {
                         venue: VenueId::Binance,
+                        market_type: Some(MarketType::LinearPerpetual),
                         is_connected: true,
                         details: "Connected to Futures /market WS".into(),
                     });
@@ -1017,6 +1022,7 @@ impl BinanceClient {
                     self.freshness.reset(BinanceStreamType::FuturesMarkPrice);
                     let _ = event_tx.try_send(MarketEvent::ConnectionState {
                         venue: VenueId::Binance,
+                        market_type: Some(MarketType::LinearPerpetual),
                         is_connected: false,
                         details: "Disconnected from Futures /market WS".into(),
                     });
