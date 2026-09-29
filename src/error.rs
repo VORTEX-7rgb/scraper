@@ -68,6 +68,15 @@ pub enum EngineError {
 
     #[error("WebSocket error: {0}")]
     WebSocket(String),
+
+    #[error("Unsupported schema version: found {found}, expected {supported}")]
+    UnsupportedSchemaVersion { found: u32, supported: u32 },
+
+    #[error("Corrupted record at line {line}: {reason}")]
+    CorruptedRecord { line: usize, reason: String },
+
+    #[error("Recording error: {0}")]
+    Recording(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;

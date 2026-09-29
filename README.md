@@ -9,18 +9,30 @@ Airbitrage does not assume arbitrage is profitable or risk-free. It treats every
 
 ---
 
-## Current Status: Milestone M2 (Local Market-State Engine Complete)
-* **Active Status:** M0 COMPLETE | M1 COMPLETE WITH M1.1 HARDENING | M2 COMPLETE | M3 NOT STARTED
-* **Toolchain:** Rust (Edition 2024, `rustc 1.98.1+`)
-* **Verified Market-State Engine:**
+## Current Status: Milestone M5.4 (Research Recording Complete)
+* **Active Status:** M0 COMPLETE | M1 COMPLETE | M2 COMPLETE | M3 COMPLETE | M4 COMPLETE | M5.1–M5.4 COMPLETE | M5.5 NEXT
+* **Toolchain:** Rust (Edition 2024, `rustc 1.85+` / `1.98.1+`)
+* **Verified Test Suite:** **135 deterministic tests passing** (`cargo test`)
+* **Market-Data Pipeline:**
   * **Binance Spot:** Continuous snapshot ingestion (`@depth20@100ms`), invariant checking, and microsecond freshness tracking.
-  * **Binance USD-M Futures:** REST depth snapshot synchronization, buffered delta drainage, $U \le S \le u$ initial alignment, continuous $pu == \text{previous } u$ sequence validation, and duplicate/old update filtering.
-  * **Order Book Lifecycle:** Explicit 6-state machine (`Empty`, `AwaitingSnapshot`, `Synchronizing`, `Live`, `Invalidated`, `Resyncing`).
-  * **Trust Gate:** Downstream code receives `trusted_book` only when state is strictly `Live`, `Valid`, uncrossed, and non-stale.
-* **Verified Venue Streams:**
-  * **Binance Spot:** `wss://stream.binance.com/ws` (`<symbol>@depth20@100ms`) → Emits canonical `MarketEvent::OrderBookSnapshot`
-  * **Binance USD-M Futures Depth:** `wss://fstream.binance.com/public/ws` (`<symbol>@depth20@100ms`) → Emits canonical `MarketEvent::OrderBookDelta` preserving `U`, `u`, `pu`, `E`, and `T`
-  * **Binance USD-M Futures Mark Price:** `wss://fstream.binance.com/market/ws` (`<symbol>@markPrice@1s`) → Emits canonical `MarketEvent::FundingRateUpdate` with mark price, index price, funding rate, and settlement timestamps
+  * **Binance USD-M Futures:** REST depth snapshot synchronization, buffered delta drainage, $U \le S \le u$ initial alignment, continuous $pu == \text{previous } u$ sequence validation, and funding rate stream tracking.
+  * **Bybit Spot & Linear:** Continuous WebSocket delta ingestion with monotonic update ID verification and snapshot re-synchronization.
+  * **Four-Book State Engine:** Deterministic multi-venue state machine (`Empty`, `AwaitingSnapshot`, `Synchronizing`, `Live`, `Invalidated`, `Resyncing`) isolating Binance Spot, Binance Linear, Bybit Spot, and Bybit Linear.
+  * **Trust Gate:** Downstream components access order books only when state is strictly `Live`, `Valid`, uncrossed, and non-stale.
+* **Executable Pricing & Cost Engine (M4):**
+  * Exact Decimal L2 order book depth walking (zero floating-point arithmetic).
+  * True Volume-Weighted Average Price (VWAP) calculation.
+  * Configurable fee modeling (maker/taker bps schedules per venue and market type).
+  * Net executable edge calculation accounting for price impact and double-sided transaction fees.
+* **Cross-Book Dislocation Observatory & Persistence Engine (M5.1–M5.3):**
+  * Live cross-venue comparison across all 4 book relationships (Spot-Spot, Perp-Perp, Spot-Perp basis).
+  * Reference-quantity sweep evaluations (e.g. 0.01, 0.1, 0.5, 1.0 BTC).
+  * Real-time opportunity persistence tracking (`Start`, `Continue`, `End`) measuring dislocation duration, tick count, peak edge, and decay half-life.
+* **Research Serialization & High-Fidelity Recording (M5.4):**
+  * Canonical schema-versioned research events (`schema_version: 1`).
+  * Newline-Delimited JSON (NDJSON) append-only recorder with explicit flush behavior.
+  * Strict separation between raw observed data (`MarketEvent`), configured assumptions, and derived analytical observations (`DislocationObservation`, `OpportunityRecord`).
+  * Loud failure on corrupted lines, truncated records, or unsupported schema versions.
 * **Live Trading:** Strictly disabled. No API keys, no private endpoints, no order routing.
 
 ---
@@ -29,12 +41,12 @@ Airbitrage does not assume arbitrage is profitable or risk-free. It treats every
 
 ### What V1 Does
 1. Ingests public, unauthenticated L2 market data and funding streams from **Binance** (Spot & USD-M Futures) and **Bybit** (Spot & Linear Futures).
-2. Reconstructs normalized, synchronized local limit order books using true protocol semantics (snapshots for full book state, deltas with `pu == previous.u` sequence continuity for incremental updates).
-3. Computes executable Volume-Weighted Average Price (VWAP) across discrete sizing tiers ($100, $500, $1,000).
-4. Models all explicit frictions: exchange-specific taker fees, book slippage, market impact, and latency decay risk.
-5. Measures dislocation persistence decay (half-life from 0ms to 60s).
-6. Records raw tick streams to compressed Zstandard files for deterministic historical replay.
-7. Simulates non-atomic execution via a realistic paper execution state machine.
+2. Reconstructs normalized, synchronized local limit order books using true protocol semantics (snapshots for full book state, deltas with strict sequence continuity for incremental updates).
+3. Computes executable Volume-Weighted Average Price (VWAP) across discrete sizing tiers.
+4. Models all explicit frictions: exchange-specific taker fees, book slippage, and market impact.
+5. Measures dislocation persistence decay and tracks complete opportunity lifecycles.
+6. Serializes raw and derived events to deterministic, schema-versioned NDJSON datasets for auditable offline research.
+7. Simulates non-atomic execution via a realistic paper execution state machine (in subsequent replay milestones).
 
 ### What V1 Explicitly Does NOT Do
 * No live order placement, order modification, or cancellation.
@@ -55,30 +67,30 @@ Airbitrage does not assume arbitrage is profitable or risk-free. It treats every
 cargo build
 ```
 
-### Run Tests (44 Passing)
+### Run Tests (135 Passing)
 ```powershell
 cargo test
 ```
 
 ### Static Analysis & Lints
 ```powershell
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-### Run Live Market-State Engine Validation (Spot + Futures Synchronized Books)
+### Live Validation Modes
 ```powershell
-cargo run -- --market-state-live 20
-```
-
-### Run Live Binance Smoke Test (Verifies Raw Ingestion Feeds)
-```powershell
+# Live Binance smoke test (public depth feeds)
 cargo run -- --binance-smoke
-```
 
-### Run Binance Continuous Soak Test
-```powershell
+# Binance soak test (continuous stream validation)
 cargo run -- --binance-soak 60
+
+# Live multi-venue market state engine validation
+cargo run -- --market-state-live 20
+
+# Live 4-book dislocation observatory
+cargo run -- --observatory-live 30
 ```
 
 ---
@@ -87,5 +99,9 @@ cargo run -- --binance-soak 60
 * [Master Phased Roadmap](docs/MASTER_PLAN.md)
 * [System Architecture](docs/ARCHITECTURE.md)
 * [Assumptions Register](docs/ASSUMPTIONS.md)
+* [M4 Executable Pricing Engine](docs/execution/m4_pricing_engine.md)
+* [M5 Dislocation Observatory](docs/observatory/m5_cross_book_dislocations.md)
+* [M5.4 Research Recording Specification](docs/recording/m5_4_research_recording.md)
 * [Binance Integration Specification](docs/venues/binance.md)
+* [Bybit Integration Specification](docs/venues/bybit.md)
 * [ADR 0001: V1 Research Scope](docs/adr/0001-v1-scope.md)

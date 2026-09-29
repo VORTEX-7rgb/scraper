@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub venues: Vec<VenueSettings>,
     #[serde(default)]
     pub observatory: ObservatorySettings,
+    #[serde(default)]
+    pub recording: RecordingSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +91,38 @@ impl Default for ObservatorySettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordingSettings {
+    #[serde(default = "default_recording_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_recording_dir")]
+    pub output_dir: PathBuf,
+    #[serde(default = "default_auto_flush")]
+    pub auto_flush: bool,
+}
+
+fn default_recording_enabled() -> bool {
+    false
+}
+
+fn default_recording_dir() -> PathBuf {
+    PathBuf::from("data/research")
+}
+
+fn default_auto_flush() -> bool {
+    true
+}
+
+impl Default for RecordingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_recording_enabled(),
+            output_dir: default_recording_dir(),
+            auto_flush: default_auto_flush(),
+        }
+    }
+}
+
 impl AppConfig {
     /// Load and validate configuration from a TOML file.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -162,6 +196,12 @@ impl AppConfig {
         if self.observatory.max_timestamp_skew_ms == 0 {
             return Err(EngineError::Config(
                 "observatory.max_timestamp_skew_ms must be greater than zero".into(),
+            ));
+        }
+
+        if self.recording.enabled && self.recording.output_dir.as_os_str().is_empty() {
+            return Err(EngineError::Config(
+                "recording.output_dir cannot be empty when recording is enabled".into(),
             ));
         }
 

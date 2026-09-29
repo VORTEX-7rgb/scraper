@@ -383,7 +383,8 @@ impl ActiveOpportunity {
 }
 
 /// Result of evaluating an observation against the persistence state machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transition", content = "record", rename_all = "snake_case")]
 pub enum PersistenceTransition {
     /// Inactive opportunity; conditions for activation not satisfied.
     None,
